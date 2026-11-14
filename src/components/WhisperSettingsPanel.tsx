@@ -99,7 +99,7 @@ export function WhisperSettingsPanel({
       const activeCount = keySlots.filter((k) => k.trim().length > 10).length;
       const saved = await saveGeminiKeyPoolToWorker(
         keySlots,
-        "gemini-2.5-flash",
+        "gemini-3.5-flash",
         Math.max(1, activeCount),
       );
       const checked = await checkGeminiKeyPoolHealth();
@@ -620,7 +620,7 @@ export function WhisperSettingsPanel({
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
               <div className="min-w-0 font-mono text-[11px] text-muted-foreground">
                 <span className="text-foreground">
-                  {workerPoolStatus?.model ?? geminiStatus?.model ?? "gemini-2.5-flash"}
+                  {workerPoolStatus?.model ?? geminiStatus?.model ?? "gemini-3.5-flash"}
                 </span>{" "}
                 · <span className="text-primary">{Math.max(1, totalConfiguredKeys)}</span> workers
               </div>

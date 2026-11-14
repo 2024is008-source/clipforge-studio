@@ -65,7 +65,7 @@ export function isGeminiKeyRetryable(err: unknown): boolean {
 }
 
 function getConfiguredGeminiModel(): string {
-  return process.env["GEMINI_VIDEO_MODEL"] || process.env["GEMINI_ANALYSIS_MODEL"] || "gemini-2.5-flash";
+  return process.env["GEMINI_VIDEO_MODEL"] || process.env["GEMINI_ANALYSIS_MODEL"] || "gemini-3.5-flash";
 }
 
 export type GeminiKeySlotStatus = {

@@ -247,7 +247,7 @@ npm run dev
 | **Ultralytics YOLOv8** (`yolov8n.pt`, `yolov8n-pose.pt`) | Person, object & pose tracking | `MODELS_DIR` or `YOLO_MODEL_PATH` |
 | **Meta AI SAM 2** (`sam2.1_hiera_*.pt`) | Optional pixel-mask subject segmentation | Set `SAM2_MODEL_PATH` & `SAM2_CONFIG` (gracefully skipped if unset) |
 | **MediaPipe BlazeFace + EfficientDet** | Same-origin browser vision fallback | Committed in `public/vision/models/*.tflite` |
-| **Google Gemini 2.5 Flash** | Viral clip discovery & campaign brief parser | Up to 5 keys in `.env` (`GEMINI_API_KEY_1`..`5`) or UI Settings |
+| **Google Gemini 3.5 Flash** | Viral clip discovery & campaign brief parser | Up to 5 keys in `.env` (`GEMINI_API_KEY_1`..`5`) or UI Settings |
 
 ---
 
@@ -274,7 +274,7 @@ GEMINI_API_KEY_2=""
 GEMINI_API_KEY_3=""
 GEMINI_API_KEY_4=""
 GEMINI_API_KEY_5=""
-GEMINI_VIDEO_MODEL="gemini-2.5-flash"
+GEMINI_VIDEO_MODEL="gemini-3.5-flash"
 
 # Reframe Engine v2 Tuning
 JUMP_CONFIRM_FRAMES="3"

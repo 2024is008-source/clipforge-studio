@@ -256,7 +256,7 @@ def get_pool_status() -> dict[str, Any]:
         saved_meta.get("model")
         or os.environ.get("GEMINI_VIDEO_MODEL")
         or os.environ.get("GEMINI_MODEL")
-        or "gemini-2.5-flash"
+        or "gemini-3.5-flash"
     )
     workers = int(
         saved_meta.get("parallel_workers")
