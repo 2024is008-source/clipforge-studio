@@ -1,0 +1,157 @@
+# ============================================================
+# ClipForge Studio — .gitignore
+# Python + Node + VSCode + env + build artifacts
+# ============================================================
+
+# ── Environment & Secrets ───────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.conda/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# mypy / pyright / ruff
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ── Node / JS / TS ──────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-store/
+
+# Build outputs
+dist/
+dist-ssr/
+.output/
+.vinxi/
+.turbo/
+out/
+.next/
+.nuxt/
+.cache/
+
+# Testing
+coverage/
+*.lcov
+.nyc_output/
+
+# ESLint / Prettier cache
+.eslintcache
+.stylelintcache
+.prettiercache
+
+# Vite / Vitest
+vite.config.ts.timestamp-*
+
+# ── Logs ────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+npm-debug.log*
+
+# ── OS ──────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── VSCode ──────────────────────────────────────────────────
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# ── JetBrains IDEs ──────────────────────────────────────────
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# ── ClipForge-specific ──────────────────────────────────────
+# Local GPU worker runtime data
+worker_data/
+# Model weights (large binary files — download at runtime)
+local_worker/models/
+local_worker/weights/
+*.pt
+*.pth
+*.onnx
+# Temporary video/audio processing
+*.tmp
+*.temp
+tmp/
+temp/
+# Rendered output clips (never committed)
+output/
+exports/
+rendered/
+# Supabase local dev
+supabase/.branches/
+supabase/.temp/
+# Bun
+.bun/

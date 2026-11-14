@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipforge-worker"
+version = "1.0.0"
+description = "ClipForge GPU-accelerated AI video clipping, active-speaker tracking, and native FFmpeg rendering worker"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Minuja Ranthika Amarasekara", email = "2024is008-source@users.noreply.github.com" }
+]
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn>=0.27.0",
+  "pydantic>=2.6.0",
+  "python-multipart>=0.0.9",
+  "faster-whisper>=1.0.1",
+  "numpy>=1.26.0",
+  "opencv-python>=4.9.0.80",
+  "ultralytics>=8.1.0",
+  "yt-dlp>=2024.3.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["local_worker/tests", "tests/unit", "tests/integration", "tests/e2e"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["node_modules", ".output", "dist", "worker_data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
