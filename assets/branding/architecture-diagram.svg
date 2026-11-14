@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 260" width="960" height="260">
+  <rect width="960" height="260" rx="16" fill="#0a0e14"/>
+  <g font-family="monospace" font-size="13" fill="#e5e7eb" text-anchor="middle">
+    <rect x="30" y="70" width="190" height="120" rx="12" fill="#111827" stroke="#22ff4e" stroke-width="2"/>
+    <text x="125" y="115" fill="#22ff4e" font-weight="bold">Studio Frontend</text>
+    <text x="125" y="140">React 19 + Canvas 2D</text>
+    <text x="125" y="162" fill="#9ca3af">localhost:8080</text>
+
+    <line x1="220" y1="130" x2="280" y2="130" stroke="#22ff4e" stroke-width="2"/>
+
+    <rect x="280" y="70" width="190" height="120" rx="12" fill="#111827" stroke="#ffd400" stroke-width="2"/>
+    <text x="375" y="115" fill="#ffd400" font-weight="bold">Local GPU Worker</text>
+    <text x="375" y="140">FastAPI + Whisper</text>
+    <text x="375" y="162" fill="#9ca3af">127.0.0.1:8765</text>
+
+    <line x1="470" y1="130" x2="530" y2="130" stroke="#ffd400" stroke-width="2"/>
+
+    <rect x="530" y="70" width="190" height="120" rx="12" fill="#111827" stroke="#22ff4e" stroke-width="2"/>
+    <text x="625" y="115" fill="#22ff4e" font-weight="bold">Vision &amp; Reframe v2</text>
+    <text x="625" y="140">YuNet + YOLOv8 + SAM2</text>
+    <text x="625" y="162" fill="#9ca3af">fill|split|grid3|fit</text>
+
+    <line x1="720" y1="130" x2="760" y2="130" stroke="#22ff4e" stroke-width="2"/>
+
+    <rect x="760" y="70" width="170" height="120" rx="12" fill="#111827" stroke="#22ff4e" stroke-width="2"/>
+    <text x="845" y="115" fill="#22ff4e" font-weight="bold">FFmpeg Master</text>
+    <text x="845" y="140">NVENC / libx264</text>
+    <text x="845" y="162" fill="#9ca3af">1080x1920 EBU R128</text>
+  </g>
+</svg>
