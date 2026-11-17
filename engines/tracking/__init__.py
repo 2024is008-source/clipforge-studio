@@ -1,5 +1,5 @@
 """ClipForge Multi-Subject Tracking & Gimbal Camera Smoothing Engine."""
-from local_worker.openshorts_engine import (
+from local_worker.clipforge_engine import (
     OneEuroFilter,
     SmoothedCameraman,
     SpeakerTracker,

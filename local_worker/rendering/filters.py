@@ -657,7 +657,7 @@ def autoclip_crop_expression(
 
     Returns (w_expr, h_expr, x_expr, y_expr) suitable for `crop=w='...':h='...':x='...':y='...'`.
     """
-    from ..openshorts_engine import build_single_pass_crop_expr
+    from ..clipforge_engine import build_single_pass_crop_expr
 
     if not frames:
         return str(source_w), str(source_h), "0", "0"

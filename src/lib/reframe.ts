@@ -522,7 +522,7 @@ export class OpenShortsSpeakerTracker {
 /**
  * Camera pursuit tuning, in normalized-source units per second so the preview moves at the same
  * rate as the worker export regardless of how often frames are sampled.
- * Mirrors CAM_* in local_worker/openshorts_engine.py.
+ * Mirrors CAM_* in local_worker/clipforge_engine.py.
  */
 export const CAM_DEADBAND_X = 0.08;
 export const CAM_DEADBAND_Y = 0.05;

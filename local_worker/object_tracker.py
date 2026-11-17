@@ -6,14 +6,14 @@ import importlib.util
 import os
 from typing import TypedDict
 
-from .openshorts_engine import (
+from .clipforge_engine import (
     OneEuroFilter,
     build_single_pass_crop_expr,
     classify_human_behaviors,
     refine_subject_silhouette,
     smooth_axis_one_euro,
 )
-from .openshorts_engine import (
+from .clipforge_engine import (
     JUMP_CONFIRM_FRAMES,
     MIN_COEXISTENCE,
     MIN_SEPARATION,

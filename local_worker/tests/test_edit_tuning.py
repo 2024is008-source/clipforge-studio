@@ -8,7 +8,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from local_worker.openshorts_engine import adaptive_cut_threshold, enforce_layout_hold
+from local_worker.clipforge_engine import adaptive_cut_threshold, enforce_layout_hold
 from local_worker.tuning import Signature, tune
 
 

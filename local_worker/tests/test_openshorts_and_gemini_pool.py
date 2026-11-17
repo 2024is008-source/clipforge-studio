@@ -14,7 +14,7 @@ from local_worker.gemini_pool import (
     is_key_retryable,
     save_key_slots,
 )
-from local_worker.openshorts_engine import (
+from local_worker.clipforge_engine import (
     SmoothedCameraman,
     SpeakerTracker,
     analyze_split_scene,
@@ -276,14 +276,14 @@ class TestOpenShortsReframeAndGeminiPool(unittest.TestCase):
 
 class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
     def test_one_euro_suppresses_stationary_jitter_and_tracks_fast_motion(self):
-        from local_worker.openshorts_engine import OneEuroFilter
+        from local_worker.clipforge_engine import OneEuroFilter
         filt = OneEuroFilter(min_cutoff=0.5, beta=0.3)
         noisy = [0.50, 0.504, 0.496, 0.503, 0.497, 0.502]
         smoothed = [filt(i * 0.1, x) for i, x in enumerate(noisy)]
         self.assertLess(max(smoothed) - min(smoothed), (max(noisy) - min(noisy)) * 0.5)
 
     def test_smooth_axis_one_euro_resets_cleanly_at_scene_cuts(self):
-        from local_worker.openshorts_engine import smooth_axis_one_euro
+        from local_worker.clipforge_engine import smooth_axis_one_euro
         times = [0.0, 0.13, 0.26, 0.39, 0.52, 0.65]
         vals = [0.22, 0.225, 0.218, 0.78, 0.782, 0.779]
         cuts = [True, False, False, True, False, False]
@@ -307,7 +307,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
 
     def test_silhouette_refiner_extracts_centroid_head_crown_and_mic_occlusion(self):
         import numpy as np
-        from local_worker.openshorts_engine import refine_subject_silhouette
+        from local_worker.clipforge_engine import refine_subject_silhouette
         frame = np.full((1080, 1920, 3), 40, dtype=np.uint8)
         frame[260:420, 920:1040] = (130, 160, 215)
         frame[420:500, 860:960] = (8, 8, 8)
@@ -318,7 +318,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
         self.assertGreater(metrics.head_yaw_bias, 0.0)
 
     def test_situational_decision_matrix_handles_object_demo_solo_cut_and_triad(self):
-        from local_worker.openshorts_engine import (
+        from local_worker.clipforge_engine import (
             BEHAVIOR_OBJECT_DEMO,
             BEHAVIOR_SILENT_CUTAWAY,
             BEHAVIOR_TRIAD_PANEL,
@@ -372,7 +372,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
         self.assertIsNotNone(track_points[2].get("x3"))
 
     def test_behavior_evidence_covers_windows_beyond_report_preview(self):
-        from local_worker.openshorts_engine import classify_human_behaviors
+        from local_worker.clipforge_engine import classify_human_behaviors
         from local_worker.speaker_priority import TalkWindow
         n = 100
         track_points = [{"t": i * 0.5 + 0.25, "x": 0.5, "y": 0.38, "mode": "fill", "cut": i == 0}
@@ -387,7 +387,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
         self.assertEqual(sorted(report["behavior_by_sample"]), [point["t"] for point in track_points])
 
     def test_behavior_evidence_does_not_cross_cuts_inside_one_audio_window(self):
-        from local_worker.openshorts_engine import (
+        from local_worker.clipforge_engine import (
             BEHAVIOR_GROUP_REACTION, BEHAVIOR_SILENT_CUTAWAY, classify_human_behaviors,
         )
         points = [{"t": t, "x": .5, "y": .38, "mode": "fit", "cut": True} for t in (0.0, .2)]
@@ -401,7 +401,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
         })
 
     def test_bystander_head_does_not_turn_solo_shot_into_group(self):
-        from local_worker.openshorts_engine import (
+        from local_worker.clipforge_engine import (
             BEHAVIOR_GROUP_REACTION,
             BEHAVIOR_SOLO_MONOLOGUE,
             classify_human_behaviors,
@@ -433,7 +433,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
         self.assertIn("fit", modes)
 
     def test_solo_closeup_between_hard_cuts_never_folds_into_fit(self):
-        from local_worker.openshorts_engine import enforce_layout_hold
+        from local_worker.clipforge_engine import enforce_layout_hold
         from local_worker.speaker_priority import TalkWindow, apply_speaker_priority
         W, H = 1920, 1080
         points = [
@@ -516,7 +516,7 @@ class SampledFramesWalk(unittest.TestCase):
             return True
 
     def test_yields_every_stride_th_frame_and_only_reads_those(self):
-        from local_worker.openshorts_engine import _sampled_frames
+        from local_worker.clipforge_engine import _sampled_frames
 
         cap = self._Cap(30)
         got = list(_sampled_frames(cap, 0, 10, 3))
@@ -525,7 +525,7 @@ class SampledFramesWalk(unittest.TestCase):
         self.assertEqual(cap.grabs, 6)
 
     def test_starts_mid_file_and_stops_when_the_stream_runs_out(self):
-        from local_worker.openshorts_engine import _sampled_frames
+        from local_worker.clipforge_engine import _sampled_frames
 
         # The fake holds eight frames from wherever the caller seeked to, so the walk keeps the
         # caller's sample grid and simply ends when the decoder does.

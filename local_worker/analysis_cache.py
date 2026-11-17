@@ -18,7 +18,7 @@ from . import config
 MAX_ENTRIES = 8
 MAX_BYTES = 32 * 1024 * 1024
 
-# openshorts_engine, tuning, layout_decision and detection_service settings only.
+# clipforge_engine, tuning, layout_decision and detection_service settings only.
 # In particular, exclude tokens, API keys, and YOLO_OFFLINE/YOLO_AUTOINSTALL (which
 # the model loader mutates). SAM2/Whisper/render settings do not affect this pass.
 ANALYSIS_ENV_NAMES = (

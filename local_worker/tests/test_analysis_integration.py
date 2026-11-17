@@ -20,7 +20,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from local_worker import layout_decision
-from local_worker import openshorts_engine as engine
+from local_worker import clipforge_engine as engine
 
 WIDTH, HEIGHT, FPS = 640, 360, 20.0
 VIDEO_PATH = str(Path(__file__).resolve().parent / "synthetic-not-on-disk.mp4")

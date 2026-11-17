@@ -176,7 +176,7 @@ class TestAnalysisCache(unittest.TestCase):
         engine = SimpleNamespace(DETECTION_STATUS={"face": "unloaded", "person": "unloaded"})
         service = SimpleNamespace(status="uninitialized", _device="cpu")
         with patch.dict(sys.modules, {
-            "local_worker.openshorts_engine": engine,
+            "local_worker.clipforge_engine": engine,
             "local_worker.detection_service": SimpleNamespace(_SERVICE=service),
         }):
             key = self.key()
