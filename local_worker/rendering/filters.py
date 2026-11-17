@@ -3,8 +3,8 @@
 Parity rule: every number here reproduces what `src/lib/render.ts` paints on the canvas, because the
 browser preview and this export must be the same edit. `crop_rect` is a direct port of
 `drawCroppedSubject`, `word_punch_zoom` of `computeOpenShortsPunchZoom`, and `sample_track` of
-`sampleTrack`. Where FFmpeg cannot match the canvas exactly (the eased layout transition, the radial
-vignette) the approximation is stated at the call site rather than hidden.
+`sampleTrack`. Where FFmpeg cannot match the canvas exactly (the eased layout transition) the
+approximation is stated at the call site rather than hidden.
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ from .framerate import rate_arg
 # src/lib/render.ts punch_in.py curve constants
 PUNCH_RISE_SEC = 0.25
 PUNCH_HOLD_SEC = 1.3
-PUNCH_FALL_SEC = 0.55
+# Paired with PUNCH_FALL_SEC in src/lib/render.ts: a 0.55 s release snapped back compared with the
+# 0.25 s push, so the frame never looked like it settled.
+PUNCH_FALL_SEC = 0.7
 PUNCH_SPAN_SEC = PUNCH_RISE_SEC + PUNCH_HOLD_SEC + PUNCH_FALL_SEC
 PUNCH_MAX_ZOOM = 1.12
 PUNCH_MIN_GAP_SEC = 8.0
@@ -42,32 +44,6 @@ GOLD_KEYWORD_RE = re.compile(
 # which clipped a mid-grey frame to pure white (YAVG 143 -> 255). Working in planar RGB restores the
 # multiplication, and the round trip through gbrp keeps `eq` from promoting tv-range 16-235 to 0-255.
 GRADE_FILTER = "format=gbrp,eq=contrast=1.05:saturation=1.14,colorchannelmixer=rr=1.02:gg=1.02:bb=1.02,format=yuv420p"
-
-# drawVignette's stops: no falloff until 62% of the way from the inner radius to the corner, then a
-# linear ramp to rgba(0,0,0,0.36) that holds to the edge of the frame.
-VIGNETTE_TRANSPARENT_STOP = 0.62
-VIGNETTE_EDGE_ALPHA = 0.36
-VIGNETTE_INNER_RADIUS = 0.3
-VIGNETTE_CENTRE_Y = 0.48
-
-
-def vignette_alpha_expression(width: int, height: int) -> str:
-    """The canvas gradient as one `geq` alpha expression, so the falloff matches the preview.
-
-    FFmpeg's own `vignette` filter was measured darkening a 1080x1920 corner crop to YAVG 0 against
-    59 unvignetted, because its ellipse is inscribed in the frame rather than scaled to its diagonal.
-    The canvas uses two circles with slightly different centres; one centre at their midpoint is the
-    stated approximation.
-    """
-    r0 = VIGNETTE_INNER_RADIUS * height
-    r1 = math.hypot(width / 2, height / 2)
-    cut = r0 + VIGNETTE_TRANSPARENT_STOP * (r1 - r0)
-    span = r1 - cut
-    max_alpha = 255 * VIGNETTE_EDGE_ALPHA
-    return (
-        f"clip((sqrt(pow(X-{width / 2:.3f},2)+pow(Y-{VIGNETTE_CENTRE_Y * height:.3f},2))"
-        f"-{cut:.3f})/{span:.3f}*{max_alpha:.3f},0,{max_alpha:.3f})"
-    )
 
 
 def caption_band(layout: str, font_size: int, height: int = OUTPUT_HEIGHT) -> tuple[int, int] | None:
@@ -108,42 +84,6 @@ def caption_anchor_y(decision: RenderDecision, layout: str) -> float:
     return configured
 
 
-def _cut_dip_filter(decision: RenderDecision | None) -> str:
-    """Brief luminance dip across verified interior scene cuts, matching `drawCutDip` in render.ts."""
-    if not decision or not decision.track or len(decision.track) < 2:
-        return ""
-    first_t = decision.track[0].t
-    cuts = [
-        round(p.t - decision.start, 4)
-        for p in decision.track
-        if p.cut and p.t > first_t + 0.001 and 0.05 < (p.t - decision.start) < decision.duration - 0.05
-    ]
-    if not cuts:
-        return ""
-    # Bound terms so extreme montage clips stay well within filter string limits.
-    terms = "+".join(f"pow(max(0,1-abs(t-{ct:.4f})/0.15),2)" for ct in cuts[:24])
-    return f"eq=brightness='-0.50*min(1,{terms})':eval=frame,"
-
-
-def _edge_blur_filter(duration: float, lead: bool, trail: bool) -> str:
-    """Blur-dip across a layout seam: out of the previous window, into the next, like the reference
-    edits. Captions and the caption band are painted after this, so text stays sharp through the dip."""
-    edge = min(0.16, duration / 4)
-    if edge < 0.06 or not (lead or trail):
-        return ""
-    ramps = ((0.0, 0.35, 26), (0.35, 0.70, 14), (0.70, 1.0, 6))
-    parts = []
-    if lead:
-        for a, b, sigma in ramps:
-            parts.append(f"gblur=sigma={sigma}:enable='between(t,{a * edge:.3f},{b * edge:.3f})'")
-    if trail:
-        for a, b, sigma in ramps:
-            parts.append(
-                f"gblur=sigma={sigma}:enable='between(t,{duration - b * edge:.3f},{duration - a * edge:.3f})'"
-            )
-    return ",".join(parts) + ","
-
-
 def _mono_pulse_filter(decision: RenderDecision | None, enabled: bool) -> str:
     """A desaturated beat on the emphasis punch, the reference's black-and-white insert."""
     if not decision or not enabled:
@@ -157,34 +97,21 @@ def _mono_pulse_filter(decision: RenderDecision | None, enabled: bool) -> str:
 
 def _grade_chain(
     label: str,
-    vignette_index: int | None,
     band: tuple[int, int] | None,
     out: str = "[out]",
     decision: RenderDecision | None = None,
-    edges: tuple[bool, bool] = (True, True),
     mono: bool = True,
 ) -> list[str]:
-    """Grade -> vignette overlay -> seam blur / mono pulse / cut dip -> caption band, as the canvas paints."""
+    """Grade -> mono pulse -> caption band, as the canvas paints."""
     effects = decision is None or decision.visual_effects
-    tail = _edge_blur_filter(decision.duration if decision else 0.0, *edges) if effects else ""
-    tail += _mono_pulse_filter(decision, mono and effects)
-    tail += _cut_dip_filter(decision) if effects else ""
+    tail = _mono_pulse_filter(decision, mono and effects)
     if band is not None:
         y, h = band
         tail += f"drawbox=x=0:y={y}:w={OUTPUT_WIDTH}:h={h}:color=0x08080A@0.84:t=fill,"
     tail += "format=yuv420p"
     if not effects:
-        # The vignette input stays declared but unconnected; FFmpeg ignores unmapped inputs.
         return [f"[{label}]{tail}{out}"]
-    if vignette_index is None:
-        return [f"[{label}]{GRADE_FILTER},{tail}{out}"]
-    # The vignette is one rgba frame; overlay repeats its last frame for the whole window, so the
-    # default `eof_action=repeat` is load-bearing and `shortest=1` must never be added here.
-    return [
-        f"[{label}]{GRADE_FILTER}[vg]",
-        f"[vg][{vignette_index}:v]overlay=format=auto[vv]",
-        f"[vv]{tail}{out}",
-    ]
+    return [f"[{label}]{GRADE_FILTER},{tail}{out}"]
 
 
 @dataclass
@@ -585,9 +512,7 @@ def build_composite_graph(
     panel_count: int,
     fps: float,
     source_index: int,
-    vignette_index: int | None = None,
     band: tuple[int, int] | None = None,
-    edges: tuple[bool, bool] = (True, True),
     mono: bool = True,
 ) -> tuple[str, str]:
     """Compose, grade, and return (filter_complex, label).
@@ -622,7 +547,7 @@ def build_composite_graph(
         chains = [f"[0:v][1:v]vstack[{label}]"]
     else:
         chains = [f"[0:v]null[{label}]"]
-    chains += _grade_chain(label, vignette_index, band, decision=decision, edges=edges, mono=mono)
+    chains += _grade_chain(label, band, decision=decision, mono=mono)
     return ";".join(chains), "[out]"
 
 
@@ -632,12 +557,10 @@ def build_video_graph(
     command_files: list[str],
     keyframes: list[list[CropFrame]],
     layout: str | None = None,
-    vignette_index: int | None = None,
     band: tuple[int, int] | None = None,
-    edges: tuple[bool, bool] = (True, True),
     mono: bool = True,
 ) -> tuple[str, str]:
-    """Single-pass graph for a one-panel layout: crop, scale to canvas, grade, vignette."""
+    """Single-pass graph for a one-panel layout: crop, scale to canvas, grade."""
     chosen = layout or layout_of(decision, decision.start)
     panel = subject_panels(decision, chosen)[0]
     w0, h0, x0, y0 = _first_rect(keyframes[0][0], decision.source_width, decision.source_height)
@@ -646,7 +569,7 @@ def build_video_graph(
         f"crop=w={w0}:h={h0}:x={x0}:y={y0},"
         f"scale={panel.dest_w}:{panel.dest_h}:flags=lanczos,setsar=1:1[comp]"
     ]
-    chains += _grade_chain("comp", vignette_index, band, decision=decision, edges=edges, mono=mono)
+    chains += _grade_chain("comp", band, decision=decision, mono=mono)
     return ";".join(chains), "[out]"
 
 

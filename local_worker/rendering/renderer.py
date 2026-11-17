@@ -39,7 +39,6 @@ from .filters import (
     resolved_font_size,
     sendcmd_file_text,
     subject_panels,
-    vignette_alpha_expression,
 )
 from .subtitles import HOOK_DURATION, paginate, write_ass
 
@@ -276,46 +275,12 @@ def _extra_audio_paths(sub: RenderDecision) -> list[str]:
     return [track.path for track in extra_audio_inputs(sub)]
 
 
-def _ensure_vignette(job_dir: str) -> str:
-    """Paint the canvas vignette once per job as an alpha frame the graph can overlay.
-
-    `geq` costs a few hundred milliseconds here and nothing during the encode, which is the opposite
-    of running it per frame. The PNG is one frame, and overlay repeats its last frame for the window.
-    """
-    path = os.path.join(job_dir, "vignette.png")
-    if os.path.isfile(path):
-        return path
-    expr = vignette_alpha_expression(OUTPUT_WIDTH, OUTPUT_HEIGHT)
-    args = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=black@0.0:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
-        "-vf",
-        f"format=rgba,geq=r=0:g=0:b=0:a='{expr}'",
-        "-frames:v",
-        "1",
-        path,
-    ]
-    out = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-    if out.returncode != 0 or not os.path.isfile(path):
-        raise RenderFailed(f"could not build the vignette frame: {out.stderr.decode('utf-8', 'replace').strip()}")
-    return path
-
-
 def plan_passes(
     request: RenderRequest,
     segment: Segment,
     index: int,
     has_audio: bool,
     font_rel: str | None,
-    vignette_path: str,
-    edges: tuple[bool, bool] = (True, True),
 ) -> tuple[list[Pass], str, int]:
     """The FFmpeg invocations for one layout window, in execution order, plus its output file."""
     job_dir = request.job_dir
@@ -339,17 +304,16 @@ def plan_passes(
     if layout == "fit" or (layout == "fill" and len(panels) == 1):
         audio_paths = _extra_audio_paths(sub)
         if layout == "fit":
-            graph, label = build_composite_graph(sub, layout, 0, fps, 0, len(audio_paths) + 1, band, edges, mono)
+            graph, label = build_composite_graph(sub, layout, 0, fps, 0, band, mono)
         else:
             frames = crop_keyframes(sub, panels[0], fps, request.punch_gain)
             cmd = _write_keyframes(job_dir, f"crop_s{index:03d}_p0.cmd", frames, sub)
-            graph, label = build_video_graph(sub, fps, [cmd], [frames], layout, len(audio_paths) + 1, band, edges, mono)
+            graph, label = build_video_graph(sub, fps, [cmd], [frames], layout, band, mono)
         video_graph = f"{graph};{label}{ass}[vout]" if ass else graph.replace("[out]", "[vout]")
         args = _base_args()
         args += ["-ss", f"{sub.start:.4f}", "-t", f"{sub.duration:.4f}", "-i", sub.source_path]
         for path in audio_paths:
             args += ["-i", path]
-        args += ["-i", vignette_path]
         fragment_graph, tail = _final_tail(sub, has_audio, 0, 1, video_graph)
         args += ["-filter_complex", fragment_graph, *tail]
         args += encoder_video_args(request.encoder, rate_arg(request.fps))
@@ -382,19 +346,14 @@ def plan_passes(
     decodes_source = needs_source or has_audio or bool(audio_paths)
     first_extra_input = source_input + 1
     args = _base_args()
-    next_input = 0
     for path in panel_files:
         args += ["-i", path]
-        next_input += 1
     if decodes_source:
         args += ["-ss", f"{sub.start:.4f}", "-t", f"{sub.duration:.4f}", "-i", sub.source_path]
-        next_input += 1
     for path in audio_paths:
         args += ["-i", path]
-        next_input += 1
-    args += ["-i", vignette_path]
     composite_graph, comp_label = build_composite_graph(
-        sub, layout, len(panel_files), fps, source_input, next_input, band, edges, mono
+        sub, layout, len(panel_files), fps, source_input, band, mono
     )
     video_graph = (
         f"{composite_graph};{comp_label}{ass}[vout]"
@@ -474,7 +433,6 @@ def _run_render(
     os.makedirs(job_dir, exist_ok=True)
     has_audio = source_has_audio(decision.source_path)
     font_rel = _prepare_font_dir(job_dir, request.font_dir) if request.overlay_dir is None else None
-    vignette_path = _ensure_vignette(job_dir)
     segments = layout_segments(decision, request.fps)
     # Per-window audio restarts loudnorm, the compressor and any fades at every seam, which dips the
     # level on each layout cut; with seams, windows go out silent and the concat mixes audio once.
@@ -485,8 +443,7 @@ def _run_render(
     caption_events = 0
     for index, segment in enumerate(segments):
         segment_passes, window_out, events = plan_passes(
-            request, segment, index, window_audio, font_rel, vignette_path,
-            (index > 0, index < len(segments) - 1),
+            request, segment, index, window_audio, font_rel,
         )
         passes += segment_passes
         window_outputs.append(window_out)

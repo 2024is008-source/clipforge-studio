@@ -120,7 +120,7 @@ class FitGeometryTest(unittest.TestCase):
             with self.subTest(source=name):
                 graph, label = build_composite_graph(
                     fit_decision(width, height, with_words=False), "fit", 0, 30000 / 1001, 0,
-                    vignette_index=1, band=(800, 100),
+                    band=(800, 100),
                 )
                 self.assertEqual(label, "[out]")
                 self.assertIn("[0:v]fps=30000/1001,split=2[fit_bg][fit_fg]", graph)
@@ -132,11 +132,12 @@ class FitGeometryTest(unittest.TestCase):
                 self.assertEqual(graph.count("crop="), 1)
                 self.assertIn("gblur=sigma=28", graph)
                 self.assertIn("[bed][fg]overlay=(W-w)/2:(H-h)/2[comp]", graph)
-                self.assertIn(f"[comp]{GRADE_FILTER}[vg]", graph)
-                self.assertIn("[vg][1:v]overlay=format=auto[vv]", graph)
+                self.assertIn(f"[comp]{GRADE_FILTER}", graph)
                 self.assertIn("drawbox=x=0:y=800:w=1080:h=100:", graph)
-                # Seam blur dips before the caption band so text stays sharp through the transition.
-                self.assertLess(graph.index("gblur=sigma=26"), graph.index("drawbox=x=0:y=800"))
+                # The only blur in a `fit` graph is the context bed behind the foreground. Nothing smears
+                # the seam, and the caption band is painted after the grade so text stays sharp.
+                self.assertEqual(graph.count("gblur"), 1)
+                self.assertLess(graph.index(GRADE_FILTER), graph.index("drawbox=x=0:y=800"))
                 self.assertNotIn("sendcmd", graph)
                 self.assertNotIn("zoompan", graph)
 
@@ -145,7 +146,7 @@ class FitGeometryTest(unittest.TestCase):
             with self.subTest(source=name):
                 graph, label = build_composite_graph(
                     fit_decision(width, height, with_words=True), "fit", 0, 30000 / 1001, 0,
-                    vignette_index=1, band=(800, 100),
+                    band=(800, 100),
                 )
                 self.assertEqual(label, "[out]")
                 self.assertIn("[0:v]fps=30000/1001,split=2[fit_bg][fit_fg]", graph)
@@ -207,10 +208,9 @@ class FitPlanTest(unittest.TestCase):
                            style=replace(decision.style, show_hook=True))
         with tempfile.TemporaryDirectory() as job_dir:
             request = RenderRequest(decision, job_dir, fps=30, encoder=cpu_encoder())
-            vignette = os.path.join(job_dir, "vignette.png")
             for index, segment in enumerate((Segment("fit", 0, 3), Segment("fit", 3, 5),
                                              Segment("fit", 5, 8))):
-                _, _, events = plan_passes(request, segment, index, False, None, vignette)
+                _, _, events = plan_passes(request, segment, index, False, None)
                 path = os.path.join(job_dir, f"captions_s{index:03d}.ass")
                 if index == 2:
                     self.assertEqual(events, 0)
@@ -229,12 +229,11 @@ class FitPlanTest(unittest.TestCase):
                 with self.subTest(layout=layout, has_audio=has_audio), tempfile.TemporaryDirectory() as job_dir:
                     decision = replace(fit_decision(), layout=layout)
                     request = RenderRequest(decision, job_dir, fps=30, encoder=cpu_encoder())
-                    vignette = os.path.join(job_dir, "vignette.png")
                     with patch("local_worker.rendering.renderer.crop_keyframes") as crops, \
                          patch("local_worker.rendering.renderer._write_keyframes") as commands, \
                          patch("local_worker.rendering.renderer.panel_crop_chain") as panels:
                         passes, output, events = plan_passes(
-                            request, Segment("fit", 0, 2), 0, has_audio, None, vignette,
+                            request, Segment("fit", 0, 2), 0, has_audio, None,
                         )
                     crops.assert_not_called()
                     commands.assert_not_called()
@@ -249,13 +248,12 @@ class FitPlanTest(unittest.TestCase):
                     self.assertEqual(events, 1)
                     self.assertEqual(os.listdir(job_dir), ["captions_s000.ass"])
                     inputs = [planned.args[i + 1] for i, arg in enumerate(planned.args) if arg == "-i"]
-                    self.assertEqual(inputs, [decision.source_path, vignette])
+                    self.assertEqual(inputs, [decision.source_path])
                     self.assertEqual(planned.args[planned.args.index("-ss") + 1], "12.5000")
                     self.assertEqual(planned.args[planned.args.index("-t") + 1], "2.0000")
                     self.assertNotIn("-qp", planned.args)
                     graph = planned.args[planned.args.index("-filter_complex") + 1]
                     self.assertIn("[0:v]fps=30/1,split=2", graph)
-                    self.assertIn("[vg][1:v]overlay=format=auto[vv]", graph)
                     self.assertIn("[out]ass=filename=captions_s000.ass[vout]", graph)
                     if has_audio:
                         self.assertIn("[0:a]aresample=48000:async=1", graph)
@@ -274,17 +272,15 @@ class FitPlanTest(unittest.TestCase):
                 AudioTrack("music", os.path.join(job_dir, "music.wav")),
             ])
             request = RenderRequest(decision, job_dir, fps=30, encoder=cpu_encoder())
-            vignette = os.path.join(job_dir, "vignette.png")
-            passes, _, events = plan_passes(request, Segment("fit", 0, 2), 0, True, None, vignette)
+            passes, _, events = plan_passes(request, Segment("fit", 0, 2), 0, True, None)
             self.assertEqual(len(passes), 1)
             self.assertEqual(events, 0)
             self.assertEqual(os.listdir(job_dir), [])
             args = passes[0].args
             inputs = [args[i + 1] for i, arg in enumerate(args) if arg == "-i"]
-            self.assertEqual(inputs, [decision.source_path, decision.audio[1].path, vignette])
+            self.assertEqual(inputs, [decision.source_path, decision.audio[1].path])
             graph = args[args.index("-filter_complex") + 1]
             self.assertIn("[1:a]aresample=48000:async=1", graph)
-            self.assertIn("[vg][2:v]overlay=format=auto[vv]", graph)
             self.assertIn("format=yuv420p[vout]", graph)
             self.assertNotIn("ass=filename", graph)
 

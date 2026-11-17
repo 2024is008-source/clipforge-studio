@@ -346,7 +346,7 @@ class RenderPlanTests(StoreCase):
             with patch.object(renderer, "_write_captions", return_value="ass=filename=c.ass") as ass, \
                  patch.object(renderer, "crop_keyframes", wraps=renderer.crop_keyframes) as crops:
                 passes, _, events = renderer.plan_passes(request, renderer.Segment("split", 0, 2), 0,
-                                                        True, None, str(self.root / "vignette.png"))
+                                                        True, None)
             graph = passes[-1].args[passes[-1].args.index("-filter_complex") + 1]
             self.assertEqual("ass=" in graph, canvas is None)
             self.assertEqual("drawbox=" in graph, canvas is None)
@@ -424,7 +424,6 @@ class RenderPlanTests(StoreCase):
         with patch.object(overlays, "store", self.store), \
              patch.object(renderer.shutil, "which", return_value="ffmpeg"), \
              patch.object(renderer, "source_has_audio", return_value=False), \
-             patch.object(renderer, "_ensure_vignette", return_value=str(self.root / "vignette.png")), \
              patch.object(renderer, "_run", side_effect=fake_encode), \
              patch.object(renderer, "frame_count", return_value=0):
             with self.assertRaisesRegex(renderer.RenderFailed, "expected exactly 1"):

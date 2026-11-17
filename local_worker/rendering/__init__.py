@@ -18,7 +18,6 @@ from .filters import (
     resolved_font_size,
     sendcmd_file_text,
     subject_panels,
-    vignette_alpha_expression,
 )
 from .renderer import (
     EncoderUnavailable,

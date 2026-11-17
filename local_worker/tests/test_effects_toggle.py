@@ -1,4 +1,4 @@
-"""The Effects switch must strip grade, vignette, seam blur, mono pulse and cut dips from the export."""
+"""The Effects switch must strip the contrast/saturation grade and the mono pulse from the export."""
 
 from __future__ import annotations
 
@@ -32,17 +32,15 @@ class EffectsToggleTest(unittest.TestCase):
         self.assertTrue(decision_from_payload(payload).visual_effects)
 
     def test_on_keeps_full_chain(self):
-        graph = ";".join(_grade_chain("comp", 1, None, decision=decision(True)))
+        graph = ";".join(_grade_chain("comp", None, decision=decision(True)))
         self.assertIn(GRADE_FILTER, graph)
-        self.assertIn("[1:v]overlay", graph)
-        self.assertIn("gblur", graph)
         self.assertIn("hue=s=0", graph)
 
     def test_off_strips_every_effect(self):
-        chains = _grade_chain("comp", 1, (800, 100), decision=decision(False))
+        chains = _grade_chain("comp", (800, 100), decision=decision(False))
         graph = ";".join(chains)
         self.assertEqual(len(chains), 1)
-        for token in (GRADE_FILTER, "overlay", "gblur", "hue=s=0", "eq=brightness"):
+        for token in (GRADE_FILTER, "hue=s=0"):
             self.assertNotIn(token, graph)
         self.assertIn("drawbox", graph)
         self.assertTrue(graph.startswith("[comp]") and graph.endswith("format=yuv420p[out]"))

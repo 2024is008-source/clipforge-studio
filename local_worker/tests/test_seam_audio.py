@@ -65,7 +65,6 @@ class ConcatAudioPlanTest(unittest.TestCase):
             request = RenderRequest(seam_decision(source), job_dir, fps=30, encoder=cpu_encoder())
             with patch.object(renderer.shutil, "which", return_value="ffmpeg"), \
                  patch.object(renderer, "source_has_audio", return_value=True), \
-                 patch.object(renderer, "_ensure_vignette", return_value=os.path.join(job_dir, "v.png")), \
                  patch.object(renderer, "layout_segments",
                               return_value=[Segment("fill", 0, 2), Segment("fit", 2, 4)]), \
                  patch.object(renderer, "plan_passes", wraps=renderer.plan_passes) as plan, \

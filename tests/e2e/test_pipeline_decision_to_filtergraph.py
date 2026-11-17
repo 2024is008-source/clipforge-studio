@@ -35,10 +35,10 @@ class TestEndToEndDecisionToFiltergraph(unittest.TestCase):
             })
             req = RenderRequest(decision=decision, job_dir=tmp, fps=30.0, encoder=cpu_encoder())
             fill_passes, fill_out, fill_events = plan_passes(
-                req, Segment("fill", 0.0, 3.0), 0, False, None, "vignette.png"
+                req, Segment("fill", 0.0, 3.0), 0, False, None
             )
             split_passes, split_out, _ = plan_passes(
-                req, Segment("split", 3.0, 6.0), 1, False, None, "vignette.png"
+                req, Segment("split", 3.0, 6.0), 1, False, None
             )
             self.assertEqual(len(fill_passes), 1)
             self.assertGreaterEqual(fill_events, 2)
