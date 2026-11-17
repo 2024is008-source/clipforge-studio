@@ -9,6 +9,14 @@ import { sampleTrack, type TrackPoint } from "./reframe";
 import {
   captionPages,
   cleanHookTitle,
+  HOOK_DURATION,
+  HOOK_FONT_SIZE,
+  HOOK_LINE_PITCH,
+  HOOK_MAX_WIDTH,
+  HOOK_PAD_X,
+  HOOK_PAD_Y,
+  HOOK_RADIUS,
+  HOOK_TOP,
   isGoldKeyword,
   pageEmoji,
   staticMotion,
@@ -388,29 +396,63 @@ function layoutEaseIn(
  * visually equivalent for a sixteenth of the pixels.
  */
 const contextBed = typeof document === "undefined" ? null : document.createElement("canvas");
+const contextBedRaw = typeof document === "undefined" ? null : document.createElement("canvas");
+
+/** Quarter-res Gaussian sigma, mirrored by filters.py `BED_BLUR_SIGMA`; CSS blur() length is the sigma. */
+export const BED_BLUR_SIGMA = 24;
+/** The reference bed keeps the shot's exposure and chroma; only the focus is gone. */
+export const BED_SATURATION = 1.1;
 
 function drawContextBed(ctx: CanvasRenderingContext2D, v: HTMLVideoElement) {
-  if (!contextBed) return;
+  if (!contextBed || !contextBedRaw) return;
   const vw = v.videoWidth || 1920,
     vh = v.videoHeight || 1080;
   const bw = Math.max(2, Math.round(W / 4)),
     bh = Math.max(2, Math.round(H / 4));
-  if (contextBed.width !== bw || contextBed.height !== bh) {
-    contextBed.width = bw;
-    contextBed.height = bh;
+  // CSS blur samples transparent black outside the drawn rect, which would fade the bed's edges;
+  // ffmpeg's gblur clamps to edge pixels instead. Replicating the edge rows/columns into a 3-sigma
+  // margin before the single blur pass keeps both pipelines identical at the frame borders.
+  const pad = BED_BLUR_SIGMA * 3;
+  const cw = bw + pad * 2,
+    ch = bh + pad * 2;
+  if (contextBed.width !== cw || contextBed.height !== ch) {
+    contextBed.width = cw;
+    contextBed.height = ch;
+    contextBedRaw.width = cw;
+    contextBedRaw.height = ch;
   }
   const b = contextBed.getContext("2d");
-  if (!b) return;
+  const r = contextBedRaw.getContext("2d");
+  if (!b || !r) return;
   // Crop out top/bottom letterbox margins (~13%) from cinematic sources so the blurred bed fills edge-to-edge with color.
   const srcY = vh * 0.13;
   const srcH = vh * 0.74;
   const cover = Math.max(bw / vw, bh / srcH);
+  const dw = vw * cover,
+    dh = srcH * cover;
+  const dx = pad + (bw - dw) / 2,
+    dy = pad + (bh - dh) / 2;
+  r.filter = "none";
+  r.clearRect(0, 0, cw, ch);
+  r.drawImage(v, 0, srcY, vw, srcH, dx, dy, dw, dh);
+  const mL = dx,
+    mT = dy,
+    mR = cw - dx - dw,
+    mB = ch - dy - dh;
+  if (mT > 0) r.drawImage(v, 0, srcY, vw, 1, dx, 0, dw, mT);
+  if (mB > 0) r.drawImage(v, 0, srcY + srcH - 1, vw, 1, dx, dy + dh, dw, mB);
+  if (mL > 0) r.drawImage(v, 0, srcY, 1, srcH, 0, dy, mL, dh);
+  if (mR > 0) r.drawImage(v, vw - 1, srcY, 1, srcH, dx + dw, dy, mR, dh);
+  if (mL > 0 && mT > 0) r.drawImage(v, 0, srcY, 1, 1, 0, 0, mL, mT);
+  if (mR > 0 && mT > 0) r.drawImage(v, vw - 1, srcY, 1, 1, dx + dw, 0, mR, mT);
+  if (mL > 0 && mB > 0) r.drawImage(v, 0, srcY + srcH - 1, 1, 1, 0, dy + dh, mL, mB);
+  if (mR > 0 && mB > 0) r.drawImage(v, vw - 1, srcY + srcH - 1, 1, 1, dx + dw, dy + dh, mR, mB);
   b.filter = "none";
-  b.clearRect(0, 0, bw, bh);
-  b.filter = "blur(12px) saturate(0.8) brightness(0.9)";
-  b.drawImage(v, 0, srcY, vw, srcH, (bw - vw * cover) / 2, (bh - srcH * cover) / 2, vw * cover, srcH * cover);
+  b.clearRect(0, 0, cw, ch);
+  b.filter = `blur(${BED_BLUR_SIGMA}px) saturate(${BED_SATURATION})`;
+  b.drawImage(contextBedRaw, 0, 0);
   b.filter = "none";
-  ctx.drawImage(contextBed, 0, 0, W, H);
+  ctx.drawImage(contextBed, pad, pad, bw, bh, 0, 0, W, H);
 }
 
 export function drawFrame(
@@ -533,9 +575,7 @@ export function drawFrame(
     ctx.fillStyle = "rgb(25,25,25)";
     ctx.fillRect(0, detailH - 2, W, 4);
   } else if (effectiveLayout === "fit") {
-    // OpenShorts contain_background: the same shot enlarged to fill, blurred, only slightly darkened.
-    // The browser used to add brightness(0.62) and a 0.32/0.48 gradient on top of a 44px blur, which is
-    // why every letterboxed export read as two black bars rather than a background.
+    // The bed is the shot thrown out of focus (drawContextBed): same exposure and chroma, no detail.
     drawContextBed(ctx, v);
 
     const hasCaptionSpace = s.captionStyle !== "none" && (job.words?.length ?? 0) > 0;
@@ -564,30 +604,30 @@ export function drawFrameOverlays(ctx: CanvasRenderingContext2D, t: number, job:
   ctx.imageSmoothingQuality = "high";
   ctx.filter = "none";
 
-  if (s.showHook && job.hook && rel < 3.6) {
-    const a = s.animations === false ? 1 : Math.min(1, rel / 0.2) * Math.min(1, (3.6 - rel) / 0.28);
+  if (s.showHook && job.hook && rel < HOOK_DURATION) {
+    const a = s.animations === false ? 1 : Math.min(1, rel / 0.2) * Math.min(1, (HOOK_DURATION - rel) / 0.28);
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = "800 44px Montserrat, Manrope, sans-serif";
-    ctx.textAlign = "left";
+    ctx.font = `800 ${HOOK_FONT_SIZE}px Montserrat, Manrope, sans-serif`;
+    ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const lines = wrap(ctx, cleanHookTitle(job.hook, job.words), W * 0.62);
-    const lh = 56,
-      left = 60,
-      top = 96;
-    const bw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 72;
-    const bh = lines.length * lh + 36;
+    const lines = wrap(ctx, cleanHookTitle(job.hook, job.words), HOOK_MAX_WIDTH - HOOK_PAD_X * 2);
+    const widest = Math.max(...lines.map((l) => ctx.measureText(l).width));
+    const bw = Math.min(HOOK_MAX_WIDTH, widest + HOOK_PAD_X * 2);
+    const bh = lines.length * HOOK_LINE_PITCH + HOOK_PAD_Y * 2;
+    const left = (W - bw) / 2;
 
-    ctx.shadowColor = "rgba(0,0,0,0.38)";
+    ctx.shadowColor = "rgba(0,0,0,0.30)";
     ctx.shadowBlur = 24;
     ctx.shadowOffsetY = 8;
     ctx.fillStyle = "#ffffff";
-    roundRect(ctx, left, top - 44, bw, bh, 22);
+    roundRect(ctx, left, HOOK_TOP, bw, bh, HOOK_RADIUS);
     ctx.fill();
 
     ctx.shadowColor = "transparent";
     ctx.fillStyle = "#0f0f12";
-    lines.forEach((l, i) => ctx.fillText(l, left + 36, top + i * lh));
+    const midY = HOOK_TOP + HOOK_PAD_Y + HOOK_LINE_PITCH / 2;
+    lines.forEach((l, i) => ctx.fillText(l, W / 2, midY + i * HOOK_LINE_PITCH));
     ctx.restore();
   }
 
@@ -870,7 +910,7 @@ export async function prepareOverlayFonts(job: ClipJob): Promise<void> {
   if (!document.fonts) throw new Error("Caption overlays require the browser Font Loading API.");
   const { settings: s } = job;
   const faces = new Map<string, string>();
-  if (s.showHook && job.hook) faces.set('800 50px "Montserrat"', cleanHookTitle(job.hook, job.words));
+  if (s.showHook && job.hook) faces.set(`800 ${HOOK_FONT_SIZE}px "Montserrat"`, cleanHookTitle(job.hook, job.words));
   if (job.cues?.length) faces.set('900 138px "Montserrat"', job.cues.map((c) => c.quote.toUpperCase()).join(" "));
   if (s.brandLabel?.trim()) faces.set('800 40px "Manrope"', s.brandLabel.trim());
   if (s.captionStyle !== "none" && job.words.length) {

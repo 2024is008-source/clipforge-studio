@@ -124,7 +124,7 @@ TRAILING_DANGLING_RE = re.compile(
 def clean_hook_title(raw_hook: str, words: list[Word] | None = None) -> str:
     """Repair mid-sentence lowercase fragments and dangling articles in Hook Pill titles.
 
-    Example: 'is a school backpack Yeah hers is a' -> 'Hers Is A School Backpack'
+    Example: 'is a school backpack Yeah hers is a' -> 'Hers is a school backpack'
     """
     text = (raw_hook or "").strip()
     if not text and words:
@@ -159,6 +159,8 @@ def clean_hook_title(raw_hook: str, words: list[Word] | None = None) -> str:
     tokens = text.split()
     if len(tokens) > 8:
         tokens = tokens[:8]
+    if tokens and tokens[0]:
+        tokens[0] = tokens[0][0].upper() + tokens[0][1:]
     return " ".join(tokens)
 
 
@@ -167,6 +169,18 @@ def _escape(text: str) -> str:
 
 
 HOOK_DURATION = 3.6
+
+# Hook card geometry at 1080x1920, mirroring src/lib/subtitles.ts HOOK_*: a centred white card near
+# the top with sentence-case bold text. libass cannot split box padding per axis, so the opaque box
+# (BorderStyle 3) uses the vertical padding on all four sides and the margins carry the wrap width.
+# MarginV carries HOOK_TOP + HOOK_PAD_Y because libass measures it to the text, not to the box edge.
+HOOK_FONT_SIZE = 60
+HOOK_LINE_PITCH = 77
+HOOK_PAD_X = 46
+HOOK_PAD_Y = 18
+HOOK_TOP = 145
+HOOK_RADIUS = 13
+HOOK_MAX_WIDTH = 810
 
 # Event fade-in per preset, in ms, mirroring the alpha and attack durations in wordMotion
 # (src/lib/subtitles.ts). libass tweens alpha and transform tags but only across a whole event, never
@@ -208,6 +222,7 @@ def write_ass(decision: RenderDecision, path: str, anchor_y: float | None = None
 
     y = OUTPUT_HEIGHT * (max(0.0, min(1.0, anchor_y)) if anchor_y is not None else style.position_y)
     anchor = r"\an5\pos" + f"({OUTPUT_WIDTH // 2},{int(round(y))})"
+    hook_margin = (OUTPUT_WIDTH - (HOOK_MAX_WIDTH - 2 * HOOK_PAD_X)) // 2
 
     lines = [
         "[Script Info]",
@@ -224,8 +239,8 @@ def write_ass(decision: RenderDecision, path: str, anchor_y: float | None = None
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Cap,{style.font},{size},{idle},{active},&H00000000,&H80000000,{bold},0,0,0,"
         f"100,100,3,0,1,{outline},{shadow},2,64,64,0,1",
-        f"Style: Hook,{style.font},{max(44, size - 38)},&H00120F0F,&H00120F0F,&H00FFFFFF,&H60000000,"
-        "-1,0,0,0,100,100,1,0,3,18,0,7,60,420,60,1",
+        f"Style: Hook,{style.font},{HOOK_FONT_SIZE},&H00120F0F,&H00120F0F,&H00FFFFFF,&H60000000,"
+        f"-1,0,0,0,100,100,0,0,3,{HOOK_PAD_Y},0,8,{hook_margin},{hook_margin},{HOOK_TOP + HOOK_PAD_Y},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -233,7 +248,7 @@ def write_ass(decision: RenderDecision, path: str, anchor_y: float | None = None
 
     cleaned_hook = clean_hook_title(decision.hook, decision.words)
     if style.show_hook and cleaned_hook and hook_duration > 0:
-        hook = _escape(cleaned_hook.upper())
+        hook = _escape(cleaned_hook)
         lines.append(
             f"Dialogue: 1,{_stamp(0.0)},{_stamp(min(hook_duration, decision.duration))},Hook,,0,0,0,,{{\\fad(160,220)}}{hook}"
         )

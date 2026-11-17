@@ -425,3 +425,13 @@ export function cleanHookTitle(rawHook: string, words?: Word[]): string {
     )
     .join(" ");
 }
+
+/** Hook card geometry at 1080x1920, mirrored by rendering/subtitles.py `Style: Hook`. */
+export const HOOK_DURATION = 3.6;
+export const HOOK_FONT_SIZE = 60;
+export const HOOK_LINE_PITCH = 77;
+export const HOOK_PAD_X = 46;
+export const HOOK_PAD_Y = 18;
+export const HOOK_TOP = 145;
+export const HOOK_RADIUS = 13;
+export const HOOK_MAX_WIDTH = 810;

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from local_worker.rendering.decision import OUTPUT_HEIGHT, OUTPUT_WIDTH, decision_from_payload
 from local_worker.rendering.encoders import cpu_encoder
 from local_worker.rendering.filters import (
+    BED_BLUR_SIGMA,
     GRADE_FILTER,
     CropFrame,
     build_composite_graph,
@@ -130,7 +131,7 @@ class FitGeometryTest(unittest.TestCase):
                     f"[fit_fg]scale={expected_w}:{expected_h}:flags=lanczos,setsar=1:1,format=yuv420p[fg]",
                 )
                 self.assertEqual(graph.count("crop="), 1)
-                self.assertIn("gblur=sigma=28", graph)
+                self.assertIn(f"gblur=sigma={BED_BLUR_SIGMA}", graph)
                 self.assertIn("[bed][fg]overlay=(W-w)/2:(H-h)/2[comp]", graph)
                 self.assertIn(f"[comp]{GRADE_FILTER}", graph)
                 self.assertIn("drawbox=x=0:y=800:w=1080:h=100:", graph)

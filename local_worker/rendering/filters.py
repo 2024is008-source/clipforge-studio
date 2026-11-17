@@ -35,6 +35,13 @@ HEAD_ANCHOR = 0.36
 SUBTITLE_SAFE_VH = 0.84
 FIT_CAPTION_FOREGROUND_HEIGHT = int(OUTPUT_HEIGHT * 0.70)
 
+# drawContextBed (src/lib/render.ts): the bed is the shot thrown out of focus at quarter canvas size,
+# then upscaled. The reference keeps the source exposure and chroma (slightly boosted), so the bed
+# reads as the same room defocused rather than a darkened or washed copy. Sigma is in quarter-res
+# pixels on both sides; CSS blur() length is the standard deviation, so the two blurs agree.
+BED_BLUR_SIGMA = 24
+BED_SATURATION = 1.1
+
 GOLD_KEYWORD_RE = re.compile(
     r"(\$|\d|million|millions|billion|thousand|grand|everything|never|impossible|charity|winner)",
     re.IGNORECASE,
@@ -539,7 +546,9 @@ def build_composite_graph(
             f"[{source_index}:v]fps={rate_arg(fps)},split=2[fit_bg][fit_fg]",
             f"[fit_bg]scale={OUTPUT_WIDTH}:2500:force_original_aspect_ratio=increase,"
             f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},"
-            f"gblur=sigma=28,eq=brightness=-0.05:saturation=1.08,setsar=1:1,format=yuv420p[bed]",
+            f"scale={OUTPUT_WIDTH // 4}:{OUTPUT_HEIGHT // 4},gblur=sigma={BED_BLUR_SIGMA},"
+            f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},eq=saturation={BED_SATURATION},"
+            f"setsar=1:1,format=yuv420p[bed]",
             f"[fit_fg]scale={foreground.dest_w}:{foreground.dest_h}:flags=lanczos,setsar=1:1,format=yuv420p[fg]",
             f"[bed][fg]overlay=(W-w)/2:{foreground_y}[{label}]",
         ]

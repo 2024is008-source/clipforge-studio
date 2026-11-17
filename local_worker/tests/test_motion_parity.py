@@ -7,20 +7,35 @@ in one pipeline cannot silently drift away from the other.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import unittest
 
 from local_worker.rendering.decision import decision_from_payload
 from local_worker.rendering.filters import (
+    BED_BLUR_SIGMA,
+    BED_SATURATION,
     PUNCH_FALL_SEC,
     PUNCH_HOLD_SEC,
     PUNCH_RISE_SEC,
     PUNCH_SPAN_SEC,
     PUNCH_MAX_ZOOM,
     _grade_chain,
+    build_composite_graph,
     word_punch_zoom,
 )
-from local_worker.rendering.subtitles import ENTRANCE_FADE_MS, write_ass
+from local_worker.rendering.subtitles import (
+    ENTRANCE_FADE_MS,
+    HOOK_DURATION,
+    HOOK_FONT_SIZE,
+    HOOK_LINE_PITCH,
+    HOOK_MAX_WIDTH,
+    HOOK_PAD_X,
+    HOOK_PAD_Y,
+    HOOK_RADIUS,
+    HOOK_TOP,
+    write_ass,
+)
 
 
 def decision(words: list[dict], style: dict) -> object:
@@ -128,6 +143,113 @@ class EntranceFadeTest(unittest.TestCase):
         self.assertIn(r"\t(180,340,\fscx100\fscy100)", content)
         # Overshoot only: a flat \fscx120 would be the old static approximation.
         self.assertNotIn(r"{\fscx120\fscy120}", content)
+
+
+class HookCardParityTest(unittest.TestCase):
+    """The hook is a centred white card near the top; canvas preview and ASS fallback share its box."""
+
+    HOOK = "Eating a city's food for a million dollars?"
+
+    def ts_hook_constants(self) -> dict[str, float]:
+        here = os.path.dirname(os.path.abspath(__file__))
+        source = os.path.join(here, "..", "..", "src", "lib", "subtitles.ts")
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read()
+        names = (
+            "HOOK_DURATION", "HOOK_FONT_SIZE", "HOOK_LINE_PITCH", "HOOK_PAD_X",
+            "HOOK_PAD_Y", "HOOK_TOP", "HOOK_RADIUS", "HOOK_MAX_WIDTH",
+        )
+        return {
+            name: float(re.search(rf"export const {name} = ([\d.]+);", text).group(1))
+            for name in names
+        }
+
+    def ass(self) -> str:
+        dec = decision_from_payload(
+            {
+                "source_path": "source.mp4",
+                "source_width": 1920,
+                "source_height": 1080,
+                "source_fps": 30.0,
+                "start": 0.0,
+                "end": 6.0,
+                "layout": "fill",
+                "track": [{"t": 0.0, "x": 0.5, "y": 0.38}],
+                "words": [],
+                "hook": self.HOOK,
+                "style": {"preset": "opus", "showHook": True},
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cap.ass")
+            write_ass(dec, path)
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                return handle.read()
+
+    def test_the_preview_constants_are_the_export_constants(self):
+        ts = self.ts_hook_constants()
+        for name, value in (
+            ("HOOK_DURATION", HOOK_DURATION), ("HOOK_FONT_SIZE", HOOK_FONT_SIZE),
+            ("HOOK_LINE_PITCH", HOOK_LINE_PITCH), ("HOOK_PAD_X", HOOK_PAD_X),
+            ("HOOK_PAD_Y", HOOK_PAD_Y), ("HOOK_TOP", HOOK_TOP),
+            ("HOOK_RADIUS", HOOK_RADIUS), ("HOOK_MAX_WIDTH", HOOK_MAX_WIDTH),
+        ):
+            self.assertEqual(ts[name], value, name)
+
+    def test_the_ass_card_is_top_centred_with_the_preview_wrap_width(self):
+        style = next(line for line in self.ass().splitlines() if line.startswith("Style: Hook,"))
+        fields = style.split(": ", 1)[1].split(",")
+        self.assertEqual(fields[2], str(HOOK_FONT_SIZE))
+        self.assertEqual(fields[15], "3")  # opaque box
+        self.assertEqual(fields[16], str(HOOK_PAD_Y))
+        self.assertEqual(fields[18], "8")  # top centre
+        margin = (1080 - (HOOK_MAX_WIDTH - 2 * HOOK_PAD_X)) // 2
+        self.assertEqual(fields[19], str(margin))
+        self.assertEqual(fields[20], str(margin))
+        self.assertEqual(fields[21], str(HOOK_TOP + HOOK_PAD_Y))
+
+    def test_the_hook_keeps_sentence_case_in_both_pipelines(self):
+        content = self.ass()
+        dialogue = next(line for line in content.splitlines() if ",Hook," in line)
+        self.assertIn("Eating a city's food", dialogue)
+        self.assertNotIn("EATING", dialogue)
+
+
+class ContextBedParityTest(unittest.TestCase):
+    """The fit bed is the shot defocused at neutral exposure, identical in canvas and export graph."""
+
+    def ts_bed_constants(self) -> dict[str, float]:
+        here = os.path.dirname(os.path.abspath(__file__))
+        source = os.path.join(here, "..", "..", "src", "lib", "render.ts")
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read()
+        return {
+            name: float(re.search(rf"export const {name} = ([\d.]+);", text).group(1))
+            for name in ("BED_BLUR_SIGMA", "BED_SATURATION")
+        }
+
+    def test_the_preview_constants_are_the_export_constants(self):
+        ts = self.ts_bed_constants()
+        self.assertEqual(ts["BED_BLUR_SIGMA"], BED_BLUR_SIGMA)
+        self.assertEqual(ts["BED_SATURATION"], BED_SATURATION)
+
+    def test_the_export_bed_is_a_quarter_res_blur_at_neutral_exposure(self):
+        dec = decision([], {"preset": "opus"})
+        graph, _ = build_composite_graph(dec, "fit", 0, 30.0, 0)
+        bed = next(chain for chain in graph.split(";") if chain.endswith("[bed]"))
+        self.assertIn(f"scale={1080 // 4}:{1920 // 4},gblur=sigma={BED_BLUR_SIGMA}", bed)
+        self.assertIn(f"eq=saturation={BED_SATURATION}", bed)
+        self.assertNotIn("eq=brightness", bed)
+        self.assertNotIn("lutyuv", bed)
+
+    def test_the_preview_blurs_and_keeps_chroma_without_darkening_or_washing(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        source = os.path.join(here, "..", "..", "src", "lib", "render.ts")
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("blur(${BED_BLUR_SIGMA}px) saturate(${BED_SATURATION})", text)
+        self.assertNotIn("brightness(0.9)", text)
+        self.assertNotIn("BED_WASH_ALPHA", text)
 
 
 if __name__ == "__main__":
