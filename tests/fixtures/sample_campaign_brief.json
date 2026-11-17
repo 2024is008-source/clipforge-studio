@@ -1,0 +1,12 @@
+{
+  "campaignName": "ClipForge Open Source Launch",
+  "platforms": ["YouTube Shorts", "TikTok", "Instagram Reels"],
+  "minDurationSec": 15,
+  "maxDurationSec": 60,
+  "requiredHashtags": ["#clipforge", "#opensource"],
+  "requiredMentions": ["@clipforge"],
+  "requiredDisclosure": "#ad",
+  "requiredCta": "Try ClipForge on GitHub",
+  "prohibitedPhrases": ["guaranteed viral"],
+  "rightsNotice": "Creator retains full ownership of generated clips."
+}

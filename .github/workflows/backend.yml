@@ -1,0 +1,40 @@
+name: Backend & Worker CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "local_worker/**"
+      - "workers/**"
+      - "engines/**"
+      - "tests/**"
+      - "pyproject.toml"
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: FastAPI Worker & Engine Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest httpx
+          pip install -r local_worker/requirements.txt
+      - name: Lint with Ruff
+        run: ruff check local_worker engines tests
+      - name: Run Worker & Engine Tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+          python -m pytest local_worker/tests -k "not test_analysis_integration"
