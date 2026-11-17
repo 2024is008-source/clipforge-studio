@@ -230,24 +230,90 @@ export function captionPages(words: Word[], count = 3): Word[][] {
   return pages;
 }
 
+export type WordMotion = {
+  active: boolean;
+  scale: number;
+  y: number;
+  alpha: number;
+  /** Eased 0→1→0 emphasis level across the word, for effects that must ramp instead of switching. */
+  activity: number;
+};
+
+/** Ease with zero velocity at both ends, so a curve never arrives or leaves at speed. */
+function smoothstep(x: number): number {
+  const t = Math.max(0, Math.min(1, x));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Continuous hump: 0 at rest, 1 at the peak, and no step where the phases meet. Used for the pop,
+ * which previously jumped straight to full scale on the word's first frame and decayed linearly, and
+ * for the bounce lift, whose raw `sin(p*PI)` reached the same peak but arrived back at rest with a
+ * non-zero velocity and a `Math.sin(Math.PI)` residue that never quite settled to zero.
+ */
+function hump(age: number, attack: number, settle: number): number {
+  if (age <= 0) return 0;
+  if (age < attack) return smoothstep(age / attack);
+  return 1 - smoothstep((age - attack) / settle);
+}
+
+/**
+ * Eased in and out around the word's window so colour, glow and the karaoke chip can interpolate
+ * across the boundary. The hold runs to the end of the word: a highlight that faded while the
+ * narration still had the word reads as the caption lagging the voice. Short words get proportionally
+ * shorter ramps, and the tail is capped at the word's own length so it cannot outlast the page.
+ */
+export function wordActivity(time: number, word: Word, rise = 0.09, fall = 0.16): number {
+  const span = Math.max(0.05, word.e - word.s);
+  const up = Math.min(rise, span / 2);
+  const down = Math.min(fall, span);
+  if (time <= word.s || time >= word.e + down) return 0;
+  if (time < word.s + up) return smoothstep((time - word.s) / up);
+  if (time > word.e) return 1 - smoothstep((time - word.e) / down);
+  return 1;
+}
+
+const BOUNCE = { attack: 0.14, settle: 0.3, peak: 0.18, lift: 24 };
+const POP = { attack: 0.09, settle: 0.3, peak: 0.12 };
+const REVEAL = { duration: 0.34, slide: 32 };
+
 /** Deterministic, word-relative motion shared by canvas preview and recorded export. */
-export function wordMotion(style: CaptionStyle, time: number, word: Word, strength = 1) {
+export function wordMotion(
+  style: CaptionStyle,
+  time: number,
+  word: Word,
+  strength = 1,
+): WordMotion {
   const elapsed = Math.max(0, time - word.s);
-  const progress = Math.min(1, elapsed / 0.28);
   const active = time >= word.s && time < word.e;
+  const activity = wordActivity(time, word);
   let scale = 1,
     y = 0,
     alpha = 1;
   if (style === "bounce" && time >= word.s) {
-    scale += Math.sin(progress * Math.PI) * 0.18 * strength;
-    y = -Math.sin(progress * Math.PI) * 24 * strength;
-  } else if ((style === "beast" || style === "opus") && active) {
-    scale += 0.12 * Math.max(0, 1 - elapsed / 0.12) * strength;
+    const a = hump(elapsed, BOUNCE.attack, BOUNCE.settle);
+    scale += BOUNCE.peak * a * strength;
+    y = -BOUNCE.lift * a * strength;
+  } else if (style === "beast" || style === "opus") {
+    scale += POP.peak * hump(elapsed, POP.attack, POP.settle) * strength;
   } else if (style === "reveal") {
-    alpha = time < word.s ? 0 : 1 - Math.pow(1 - progress, 3);
-    y = (1 - alpha) * 32 * strength;
+    const p = Math.min(1, elapsed / REVEAL.duration);
+    alpha = time < word.s ? 0 : 1 - Math.pow(1 - p, 3);
+    y = (1 - alpha) * REVEAL.slide * strength;
   }
-  return { active, scale, y: y === 0 ? 0 : y, alpha };
+  return { active, scale, y: y === 0 ? 0 : y, alpha, activity };
+}
+
+/** Motion a preset applies when animation is off: the settled end state, with no ramp. */
+export function staticMotion(style: CaptionStyle, time: number, word: Word): WordMotion {
+  const active = time >= word.s && time < word.e;
+  return {
+    active,
+    scale: 1,
+    y: 0,
+    alpha: style === "reveal" && time < word.s ? 0 : 1,
+    activity: active ? 1 : 0,
+  };
 }
 
 export function subtitleTimestamp(seconds: number, separator = ",") {

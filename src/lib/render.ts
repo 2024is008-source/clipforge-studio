@@ -1,12 +1,21 @@
 // OpenShorts v2 & OpusClip-grade clip renderer:
 // - Dynamic Multi-Layout: TRACK (fill), SPLIT (2-speaker vstack), EDITORIAL (detail top + full-width context bottom), BLUR (fit)
-// - Punch-in zoom from BOTH sources: worker audio-envelope beats on the track + word emphasis (RISE=0.25s, HOLD=1.30s, FALL=0.55s, MAX_ZOOM=1.12)
+// - Punch-in zoom from BOTH sources: worker audio-envelope beats on the track + word emphasis (RISE=0.25s, HOLD=1.30s, FALL=0.70s, MAX_ZOOM=1.12)
 // - Layout-aware & face-safe caption placement (caption_timing.py: 0.50 on SPLIT, 0.58 on EDITORIAL)
-// - Auto polish: scene-cut dips, vignette, contrast/saturation grade, big number callouts from editing cues, lower third, audio fades
+// - Auto polish: contrast/saturation grade, big number callouts from editing cues, lower third, audio fades
 import type { Word } from "./media";
 import { layoutTransitionSec, punchGainOf } from "./edit-tuning";
 import { sampleTrack, type TrackPoint } from "./reframe";
-import { captionPages, cleanHookTitle, isGoldKeyword, pageEmoji, wordMotion, type CaptionStyle } from "./subtitles";
+import {
+  captionPages,
+  cleanHookTitle,
+  isGoldKeyword,
+  pageEmoji,
+  staticMotion,
+  wordMotion,
+  type CaptionStyle,
+  type WordMotion,
+} from "./subtitles";
 import { browserCaptureForced, renderWithLocalBackend } from "./backend-render";
 import { HELPER } from "@/components/YouTubeImport";
 
@@ -77,17 +86,34 @@ export function fitGeometry(sourceW: number, sourceH: number, outputW = W, outpu
 // OpenShorts punch_in.py smoothstep curve constants
 const PUNCH_RISE_SEC = 0.25;
 const PUNCH_HOLD_SEC = 1.3;
-const PUNCH_FALL_SEC = 0.55;
+// A 0.55 s release read as a snap-back because the push out had nowhere near as much time as the
+// pull in. 0.70 keeps the asymmetric feel while letting the frame settle. local_worker PUNCH_FALL_SEC.
+const PUNCH_FALL_SEC = 0.7;
 const PUNCH_SPAN_SEC = PUNCH_RISE_SEC + PUNCH_HOLD_SEC + PUNCH_FALL_SEC;
 const PUNCH_MAX_ZOOM = 1.12;
 
 // Auto-polish constants (OpenShorts editing_director + export_quality look)
-const CUT_DIP_SEC = 0.15;
 const GRADE = "contrast(1.05) saturate(1.14) brightness(1.02)";
 
 function smoothstep(x: number): number {
   const t = Math.max(0, Math.min(1, x));
   return t * t * (3 - 2 * t);
+}
+
+/** Interpolate two #rrggbb colours so a glow can bloom across a word boundary instead of switching. */
+function mixHex(a: string, b: string, x: number): string {
+  const parse = (h: string) => {
+    const s = (h || "").replace("#", "");
+    const v = s.length === 3 ? s.replace(/./g, (c) => c + c) : s;
+    return [0, 2, 4].map((i) => parseInt(v.slice(i, i + 2), 16));
+  };
+  const from = parse(a);
+  const to = parse(b);
+  if (!from.every(Number.isFinite) || !to.every(Number.isFinite)) return x > 0.5 ? b : a;
+  const t = Math.max(0, Math.min(1, x));
+  return `#${from
+    .map((c, i) => Math.round(c + (to[i]! - c) * t).toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 /** Overshoot-then-settle pop used by hook cards, number callouts and emojis. */
@@ -155,35 +181,6 @@ function drawCroppedSubject(
   ctx.drawImage(v, sx, sy, cropW, cropH, dx, dy, dw, dh);
 }
 
-/** Dip-to-black centred on each verified scene cut, so hard cuts read as edits, not glitches. */
-function drawCutDip(ctx: CanvasRenderingContext2D, track: TrackPoint[] | undefined, t: number) {
-  if (!track || track.length < 2) return;
-  const firstT = track[0]!.t;
-  let k = 0;
-  for (const p of track) {
-    if (!p.cut || p.t <= firstT + 0.001) continue;
-    const d = Math.abs(t - p.t);
-    if (d < CUT_DIP_SEC) k = Math.max(k, 1 - d / CUT_DIP_SEC);
-  }
-  if (k <= 0) return;
-  ctx.fillStyle = `rgba(0,0,0,${(0.85 * k * k).toFixed(3)})`;
-  ctx.fillRect(0, 0, W, H);
-}
-
-const EDGE_BLUR_SEC = 0.16;
-/** Blur-dip straddling layout seams and verified cuts, mirroring the worker's _edge_blur_filter. */
-function seamDipBlur(track: TrackPoint[] | undefined, t: number): number {
-  if (!track || track.length < 2) return 0;
-  let d = Infinity;
-  let prevMode = track[0]!.mode;
-  for (let i = 1; i < track.length; i++) {
-    const p = track[i]!;
-    if (p.cut || p.mode !== prevMode) d = Math.min(d, Math.abs(t - p.t));
-    prevMode = p.mode;
-  }
-  return d < EDGE_BLUR_SEC ? 26 * (1 - d / EDGE_BLUR_SEC) : 0;
-}
-
 /** Desaturated emphasis beat, mirroring the worker's _mono_pulse_filter. */
 function punchMonoActive(words: Word[], t: number): boolean {
   let last = -100;
@@ -195,29 +192,6 @@ function punchMonoActive(words: Word[], t: number): boolean {
     }
   }
   return false;
-}
-
-/** Cinematic edge falloff; Opus keeps the centre of interest brightest. */
-let vignetteFill: CanvasGradient | null = null;
-function drawVignette(ctx: CanvasRenderingContext2D) {
-  // The gradient is identical on every frame of every render; rebuilding it 30 times a second is
-  // cost the capture loop cannot spend without dropping the frames it then pads in mastering.
-  if (!vignetteFill) {
-    const g = ctx.createRadialGradient(
-      W / 2,
-      H * 0.46,
-      H * 0.3,
-      W / 2,
-      H * 0.5,
-      Math.hypot(W / 2, H / 2),
-    );
-    g.addColorStop(0, "rgba(0,0,0,0)");
-    g.addColorStop(0.62, "rgba(0,0,0,0)");
-    g.addColorStop(1, "rgba(0,0,0,0.36)");
-    vignetteFill = g;
-  }
-  ctx.fillStyle = vignetteFill;
-  ctx.fillRect(0, 0, W, H);
 }
 
 const NUMBER_WORD = /(\$|\d|million|billion|thousand|percent)/i;
@@ -468,11 +442,8 @@ export function drawFrame(
     ? "fit" : s.layout === "auto" ? (tp.mode ?? "fill") : s.layout;
 
   const effects = s.effects !== false;
-  const dip = effects ? seamDipBlur(job.track, t) : 0;
   const mono = effects && s.zoomPunch && punchMonoActive(job.words, t);
-  ctx.filter = effects
-    ? GRADE + (dip > 0.5 ? ` blur(${dip.toFixed(1)}px)` : "") + (mono ? " saturate(0)" : "")
-    : "none";
+  ctx.filter = effects ? GRADE + (mono ? " saturate(0)" : "") : "none";
   // Anything the tracker does not name explicitly renders as a full-frame crop, never a pillarbox.
   if (
     effectiveLayout !== "split" &&
@@ -577,10 +548,6 @@ export function drawFrame(
   }
   ctx.filter = "none";
 
-  if (effects) {
-    drawCutDip(ctx, job.track, t);
-    drawVignette(ctx);
-  }
   drawFrameOverlays(ctx, t, job);
   ctx.restore();
 }
@@ -714,12 +681,10 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
     const em = pageEmoji(pg);
     if (em && t >= em.triggerTime - 0.05) {
       const elapsed = Math.max(0, t - em.triggerTime);
-      const pop =
-        s.animations === false
-          ? 1
-          : elapsed < 0.18
-            ? Math.sin((elapsed / 0.18) * (Math.PI / 2)) * 1.15
-            : Math.max(1, 1.15 - (elapsed - 0.18) * 0.5);
+      // popScale already carries hook cards and number callouts; the emoji used to run its own
+      // quarter-sine attack followed by a linear decay, so it settled differently from everything
+      // else on screen.
+      const pop = s.animations === false ? 1 : popScale(elapsed, 0.18, 0.16, 1.15);
       const emojiY = baseY - lh * 0.95;
       const emojiFont = `${Math.round(size * 1.55)}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
       const sprite = styledTextSprite(ctx, {
@@ -758,24 +723,31 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
     const y = baseY + li * lh;
 
     line.forEach((w, i) => {
-      const motion =
+      const motion: WordMotion =
         s.animations === false
-          ? { active: t >= w.s && t < w.e, scale: 1, y: 0, alpha: s.captionStyle === "reveal" && t < w.s ? 0 : 1 }
+          ? staticMotion(s.captionStyle, t, w)
           : wordMotion(s.captionStyle, t, w, s.animationStrength ?? 1);
       const active = motion.active;
       const past = t > w.e;
       const ww = widths[i] ?? 0;
 
       ctx.save();
-      ctx.globalAlpha = motion.alpha;
+      ctx.globalAlpha = motion.alpha * (s.captionStyle === "karaoke" && t < w.s ? 0.85 : 1);
       ctx.translate(x + ww / 2, y + motion.y);
       ctx.scale(motion.scale, motion.scale);
       ctx.translate(-(x + ww / 2), -y);
 
-      if (s.captionStyle === "karaoke" && active) {
+      // The chip used to appear and vanish on a single frame at each word boundary. Easing its
+      // alpha and inset with the word makes it arrive as a sweep rather than a strobe.
+      const chip = s.captionStyle === "karaoke" ? motion.activity : 0;
+      if (chip > 0.002) {
+        const grow = size * 0.12 * (1 - chip);
+        ctx.save();
+        ctx.globalAlpha = motion.alpha * chip;
         ctx.fillStyle = s.highlight;
-        roundRect(ctx, x - 14, y - size * 0.62, ww + 28, size * 1.2, 16);
+        roundRect(ctx, x - 14 - grow, y - size * 0.62 - grow, ww + 28 + grow * 2, size * 1.2 + grow * 2, 16);
         ctx.fill();
+        ctx.restore();
       }
 
       let visible = txt(w);
@@ -791,10 +763,13 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
       ctx.miterLimit = 2;
 
       const glow = s.captionStyle === "glow";
+      // Quantised to a ladder because the sprite cache keys on shadowBlur and colour: a continuous
+      // value would build a new offscreen canvas every frame, the cost the vignette gradient avoids.
+      const glowLevel = glow ? Math.round(motion.activity * 5) / 5 : 0;
       const shadow: Pick<StyledTextSprite, "shadowColor" | "shadowBlur" | "shadowOffsetY"> = glow
         ? {
-            shadowColor: active ? s.highlight : "#000",
-            shadowBlur: active ? 28 : 12,
+            shadowColor: mixHex("#000000", s.highlight, glowLevel),
+            shadowBlur: 12 + 16 * glowLevel,
             shadowOffsetY: 0,
           }
         : { shadowColor: "rgba(0,0,0,0.85)", shadowBlur: 10, shadowOffsetY: 6 };
@@ -814,7 +789,9 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
             ? s.highlight
             : "#fff"
           : s.captionStyle === "karaoke"
-            ? active
+            ? // Flip at the chip's half-ramp instead of the hard word edge, so text and box cross
+              // over together and never leave white letters on a half-faded box.
+              motion.activity >= 0.5
               ? "#000"
               : past
                 ? "#fff"
@@ -824,7 +801,7 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
               : "#fff";
       }
 
-      const skipStroke = s.captionStyle === "karaoke" && active;
+      const skipStroke = s.captionStyle === "karaoke" && motion.activity >= 0.5;
       const sprite = styledTextSprite(ctx, {
         text: visible,
         font: font(),

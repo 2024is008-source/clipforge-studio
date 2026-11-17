@@ -22,7 +22,10 @@ describe("Subtitle timing and animation", () => {
   });
   it("hides slide reveal words until their narration starts", () => {
     expect(wordMotion("reveal", 0, { w: "Hello", s: 1, e: 2 }).alpha).toBe(0);
-    expect(wordMotion("reveal", 1.3, { w: "Hello", s: 1, e: 2 }).alpha).toBe(1);
+    // The ease now spans 0.34s, so the word is still climbing a frame after it starts rather than
+    // arriving opaque. Fully revealed by 1.4.
+    expect(wordMotion("reveal", 1.05, { w: "Hello", s: 1, e: 2 }).alpha).toBeLessThan(0.5);
+    expect(wordMotion("reveal", 1.4, { w: "Hello", s: 1, e: 2 }).alpha).toBe(1);
   });
   it("splits pages by phrase, not by a fixed word count", () => {
     const words = ["One", "two.", "Three", "four", "five"].map((w, i) => ({ w, s: i, e: i + 1 }));

@@ -1,8 +1,12 @@
 """Caption pages, karaoke highlighting and styling as an ASS file libass can burn.
 
-The browser paints word-by-word motion with `wordMotion`; FFmpeg cannot reproduce a spring, so the
-active word arrives with a karaoke colour sweep plus a short fade instead. Text, segmentation,
-timing, colour and placement all carry over unchanged.
+The browser paints word-by-word motion with `wordMotion`. libass can only tween across a whole event,
+never per word inside one, so this file carries the page-level part of that motion - entrance fades
+matched to each preset's attack, and an animated emoji overshoot - and leaves the word-relative spring
+to the sweep. Text, segmentation, timing, colour and placement all carry over unchanged.
+
+For frame-exact motion in an exported file, use the PNG overlay pipeline (`rendering/overlays.py`),
+which composites what the canvas actually drew.
 """
 
 from __future__ import annotations
@@ -164,6 +168,26 @@ def _escape(text: str) -> str:
 
 HOOK_DURATION = 3.6
 
+# Event fade-in per preset, in ms, mirroring the alpha and attack durations in wordMotion
+# (src/lib/subtitles.ts). libass tweens alpha and transform tags but only across a whole event, never
+# per word inside one, so the fade is the part that carries over honestly:
+#   reveal eases its alpha over REVEAL_DURATION_SEC, the pop presets attack over POP_ATTACK_SEC, and
+#   bounce/typewriter have no alpha ramp in the preview at all, so they must not gain one here.
+ENTRANCE_FADE_MS = {
+    "opus": 90,
+    "beast": 90,
+    "karaoke": 80,
+    "minimal": 80,
+    "bounce": 0,
+    "typewriter": 0,
+    "glow": 90,
+    "reveal": 360,
+}
+
+# popScale(age, 0.18, 0.16, 1.15) in src/lib/render.ts, expressed as libass transform tweens:
+# 0-180 ms to the 1.15 overshoot, 180-340 ms back to rest.
+EMOJI_POP = r"{\t(0,180,\fscx115\fscy115)\t(180,340,\fscx100\fscy100)}"
+
 
 def write_ass(decision: RenderDecision, path: str, anchor_y: float | None = None,
               *, hook_duration: float = HOOK_DURATION) -> str:
@@ -224,9 +248,9 @@ def write_ass(decision: RenderDecision, path: str, anchor_y: float | None = None
             parts.append(f"{{\\k{centis}{lead}}}{token} ")
         text = "".join(parts).rstrip()
         if style.show_emojis and page.emoji:
-            text = f"{text} {{\\fscx120\\fscy120}}{page.emoji}"
-        # The block fades in rather than springing, which is the documented approximation.
-        text = r"{\fad(80,0)" + anchor + "}" + text
+            text = f"{text} {EMOJI_POP}{page.emoji}"
+        fade = ENTRANCE_FADE_MS.get(style.preset, 80)
+        text = rf"{{\fad({fade},0)" + anchor + "}" + text
         lines.append(f"Dialogue: 0,{_stamp(page.start)},{_stamp(page.end)},Cap,,0,0,0,,{text}")
 
     content = "\n".join(lines) + "\n"

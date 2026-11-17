@@ -66,4 +66,4 @@ jobs:
       - name: Run Python test suites
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
-          python -m unittest local_worker/tests/test_analysis_cache.py local_worker/tests/test_layout_decision.py local_worker/tests/test_speaker_priority.py local_worker/tests/test_segmentation_service.py local_worker/tests/test_detection_service.py local_worker/tests/test_openshorts_and_gemini_pool.py local_worker/tests/test_shot_boundaries.py local_worker/tests/test_intelligence_api.py
+          python -m unittest local_worker/tests/test_analysis_cache.py local_worker/tests/test_layout_decision.py local_worker/tests/test_speaker_priority.py local_worker/tests/test_segmentation_service.py local_worker/tests/test_detection_service.py local_worker/tests/test_openshorts_and_gemini_pool.py local_worker/tests/test_shot_boundaries.py local_worker/tests/test_motion_parity.py local_worker/tests/test_intelligence_api.py
