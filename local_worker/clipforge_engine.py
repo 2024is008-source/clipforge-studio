@@ -62,6 +62,12 @@ SCENE_CUT_RESET = os.environ.get("SCENE_CUT_RESET", "1") != "0"
 MIN_COEXISTENCE = 0.50
 MIN_SEPARATION = 0.20
 MIN_FACE_WIDTH = 0.045
+# What a shot has to show for itself before it keeps a 2-up panel, measured on that shot rather than on
+# the clip around it: a two-hander that lasts four seconds inside a forty-second monologue is still a
+# two-hander, and a show that never frames anybody twice still has the odd over-the-shoulder pair.
+SPLIT_SHOT_MIN_SEC = 1.2
+SPLIT_SHOT_TWO_FACE_SHARE = 0.35
+SPLIT_SHOT_MAX_FACE_WIDTH = 0.22
 SPLIT_TIGHTNESS = float(os.environ.get("SPLIT_TIGHTNESS", "0.8"))
 MAX_FACE_OVERLAP = 0.30
 
@@ -77,6 +83,12 @@ CAM_TAU_X = float(os.environ.get("CAM_TAU_X", "0.38"))  # seconds to close ~63% 
 CAM_TAU_Y = float(os.environ.get("CAM_TAU_Y", "0.55"))
 CAM_MAX_SPEED_X = float(os.environ.get("CAM_MAX_SPEED_X", "0.55"))  # crop widths per second at unit error
 CAM_MAX_SPEED_Y = float(os.environ.get("CAM_MAX_SPEED_Y", "0.45"))
+# How fast the virtual cameraman may reach that speed, in caps of top speed per second. A rig that is
+# permitted to be at full tilt within one sample reads as a servo snapping; 3.2 gives ~0.3 s of ramp,
+# which is how long a handheld operator needs to start a pan without the frame jolting. The preview
+# needs no constant of its own to mirror: OpenShortsSmoothedCameraman.pursue is a first-order lag, so
+# its velocity is eased by construction and only jolts when the cap truncates it, which it rarely does.
+CAM_ACCEL_K = float(os.environ.get("CAM_ACCEL_K", "3.2"))
 # How long a shot or layout stays on screen before the edit may change it again comes from
 # tuning.py, measured off this video's own cut rhythm — a single global number is what made fast-cut
 # footage look like it was stuttering and long takes look like they were being punched.
@@ -85,6 +97,16 @@ CAM_MAX_SPEED_Y = float(os.environ.get("CAM_MAX_SPEED_Y", "0.45"))
 CUT_THR_MIN = float(os.environ.get("CUT_THR_MIN", "0.16"))
 CUT_THR_MAX = float(os.environ.get("CUT_THR_MAX", "0.55"))
 CUT_THR_SIGMAS = float(os.environ.get("CUT_THR_SIGMAS", "3.0"))
+# The shortest run a shot may have before the edit is believed. Below this the "cut" is a strobe, a
+# whip pan or a two-frame insert, and re-aiming the camera at it is what made the ghost-hunter
+# footage snap to a lightning flash and lose the speaker identity behind it.
+MIN_SHOT_SEC = float(os.environ.get("MIN_SHOT_SEC", "0.45"))
+# An excursion that comes back to the frame it left was never a shot. Look this many samples past the
+# spike for the return, and require the return to be this much closer to the outgoing histogram than
+# the spike was. At the default 7.5 Hz sample rate the window is 0.4 s, which is shorter than any
+# real reverse shot and longer than any camera flash.
+CUT_TRANSIENT_LOOKAHEAD = 3
+CUT_TRANSIENT_RATIO = 0.5
 
 # Active speaker: the talker-attribution window is owned by speaker_priority, and this is the same
 # number the audio envelope is cut into, so the two clocks cannot drift apart.
@@ -1375,19 +1397,59 @@ def smooth_trajectory_zero_phase(
     return smoothed_out
 
 
+def _ramp_axis(
+    requested: list[float], times: list[float], limit: float, accel_k: float
+) -> list[float]:
+    """Drive one axis up to `limit` and settle it exactly on the framing the run ends on.
+
+    The bound at each sample is the tighter of two: how fast the rig could have got there from where it
+    was, and how fast it can still brake. That is the time-optimal trapezoid — full tilt in the middle
+    of a long pan, a triangle when the move is too short to reach top speed, and no lurch at either end
+    because both are ramped at accel_k caps of top speed per second.
+    """
+    # The farthest framings still ahead at each sample: the runway the camera has to stop inside.
+    runway: list[tuple[float, float]] = [(0.0, 0.0)] * len(requested)
+    lo = hi = requested[-1]
+    for k in range(len(requested) - 1, -1, -1):
+        lo, hi = min(lo, requested[k]), max(hi, requested[k])
+        runway[k] = (lo, hi)
+    out = [requested[0]]
+    velocity = 0.0
+    for k in range(1, len(requested)):
+        dt = max(1e-3, times[k] - times[k - 1])
+        accel = accel_k * limit
+        wanted = (requested[k] - out[-1]) / dt
+        step = min(max(wanted, velocity - accel * dt), velocity + accel * dt)
+        step = min(max(step, -limit), limit)
+        panel_lo, panel_hi = runway[k]
+        room = max(abs(panel_lo - out[-1]), abs(panel_hi - out[-1]))
+        # Braking is planned, not reacted to. The stop-to distance is a ceiling the rig eases into at
+        # its own acceleration, never a wall it can hit inside one sample.
+        band = max(min(math.sqrt(2.0 * accel * room), limit), abs(velocity) - accel * dt)
+        step = min(max(step, -band), band)
+        out.append(round(out[-1] + step * dt, 4))
+        velocity = step
+    return out
+
+
 def limit_pursuit_rate(
-    points: list[dict[str, Any]], max_speed_x: float, max_speed_y: float
+    points: list[dict[str, Any]],
+    max_speed_x: float,
+    max_speed_y: float,
+    accel_k: float = CAM_ACCEL_K,
 ) -> list[dict[str, Any]]:
-    """Cap how fast the virtual camera may travel, one layout at a time.
+    """Cap how fast and how quickly the virtual camera may travel, one layout at a time.
 
     Smoothing is not a speed limit: a detector that puts a head somewhere else for one sample, or the
     speaking rule handing a crop to a different person, both survive a Gaussian as a shorter, faster
     step. The pan then reads as a jolt — a camera correcting itself — rather than a camera following a
     person.
 
-    Each layout keeps its opening framing, because that is the frame the cut was made on; the rest of
-    the run catches up at the pursuit law's own speed. Slowing down is the cost, and a run that lasts
-    the hold has the time to pay it.
+    A cap alone fixes that jolt but replaces it with a worse one: the rig is at full tilt within one
+    sample and frozen again in the next, which is how a servo behaves, not a person. So the moves are
+    ramped at CAM_ACCEL_K. A shot that begins on a cut still opens on the framing that cut was made to,
+    because the edit — not the camera — changed the frame there; a layout switch inside a shot does not
+    get that, and is eased into from wherever the camera had got to.
     """
     if len(points) <= 2 or max_speed_x <= 0 or max_speed_y <= 0:
         return points
@@ -1396,22 +1458,19 @@ def limit_pursuit_rate(
     begin = 0
     for i in range(1, len(out) + 1):
         if i == len(out) or out[i].get("cut") or mode_of(out[i]) != mode_of(out[i - 1]):
-            for k in range(begin + 1, i):
-                dt = max(1e-3, float(out[k]["t"]) - float(out[k - 1]["t"]))
-                for key, limit in (
-                    ("x", max_speed_x),
-                    ("y", max_speed_y),
-                    ("x2", max_speed_x),
-                    ("y2", max_speed_y),
-                ):
-                    if key not in out[k]:
-                        continue
-                    here = float(out[k][key])
-                    there = float(out[k - 1].get(key, here))
-                    step = here - there
-                    cap = limit * dt
-                    if abs(step) > cap:
-                        out[k][key] = round(there + math.copysign(cap, step), 4)
+            times = [float(p["t"]) for p in out[begin:i]]
+            axes = (("x", max_speed_x), ("y", max_speed_y), ("x2", max_speed_x), ("y2", max_speed_y))
+            run = out[begin:i]
+            for key, limit in axes:
+                if any(key not in p for p in run):
+                    continue
+                requested = [float(p[key]) for p in run]
+                if begin and not run[0].get("cut") and key in out[begin - 1]:
+                    # A layout switch mid-shot is not a cut. The rig carries on from where it had got
+                    # to and eases into the new composition instead of teleporting to its opening frame.
+                    requested[0] = float(out[begin - 1][key])
+                for offset, value in enumerate(_ramp_axis(requested, times, limit, accel_k)):
+                    run[offset][key] = value
             begin = i
     return out
 
@@ -1472,6 +1531,55 @@ def apply_scene_split_layout(
                 continue
             pt["mode"], pt["x"], pt["y"], pt["x2"], pt["y2"] = "split", left[0], left[1], right[0], right[1]
     return scenes
+
+
+def shot_face_evidence(
+    track_points: list[dict[str, Any]],
+    scene_candidates: list[list[dict[str, Any]]],
+    orig_w: int,
+) -> list[dict[str, Any]]:
+    """How strongly each shot on its own stages two people, measured the way the clip is measured.
+
+    `analyze_split_scene` already refuses a scene whose two faces do not coexist, but the clip-wide gate
+    that used to sit on top of it could not tell a four-second two-hander inside a forty-second
+    monologue from a show that never frames anybody twice, and folded the real one away with the noise.
+    """
+    out: list[dict[str, Any]] = []
+    for begin, end in _scene_spans(track_points):
+        widths: list[float] = []
+        two = 0
+        for cands in scene_candidates[begin:end]:
+            big = [c for c in dedupe_faces(cands) if c["box"][2] >= MIN_FACE_WIDTH * orig_w]
+            if len(big) >= 2:
+                two += 1
+            if big:
+                widths.append(max(c["box"][2] for c in big) / float(orig_w))
+        count = end - begin
+        out.append({
+            "begin": begin,
+            "end": end,
+            "seconds": round(track_points[end - 1]["t"] - track_points[begin]["t"], 3) if count else 0.0,
+            "two_face_share": round(two / count, 3) if count else 0.0,
+            "median_face_width": round(statistics.median(widths), 4) if widths else 0.0,
+        })
+    return out
+
+
+def enforce_shot_split_evidence(
+    track_points: list[dict[str, Any]], evidence: list[dict[str, Any]]
+) -> int:
+    """Fold a 2-up back to one subject unless that shot, and not the clip around it, earned it."""
+    folded = 0
+    for shot in evidence:
+        if (shot["seconds"] >= SPLIT_SHOT_MIN_SEC
+                and shot["two_face_share"] >= SPLIT_SHOT_TWO_FACE_SHARE
+                and shot["median_face_width"] <= SPLIT_SHOT_MAX_FACE_WIDTH):
+            continue
+        for pt in track_points[shot["begin"]:shot["end"]]:
+            if pt["mode"] == "split":
+                pt["mode"], pt["x2"], pt["y2"] = "fill", pt["x"], pt["y"]
+                folded += 1
+    return folded
 
 
 def enforce_layout_hold(
@@ -1580,12 +1688,147 @@ def adaptive_cut_threshold(dists: list[float]) -> float:
     return max(CUT_THR_MIN, min(CUT_THR_MAX, med + CUT_THR_SIGMAS * mad))
 
 
+def _histogram_of_hsv(cv2, hsv) -> Any:
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
+
+def _hist_distance(cv2, a, b) -> float:
+    return float(cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA))
+
+
+def shot_boundaries(
+    cv2,
+    hists: list[Any],
+    sample_frames: list[int],
+    fps: float,
+    thr: float,
+    min_shot_sec: float = MIN_SHOT_SEC,
+    lookahead: int = CUT_TRANSIENT_LOOKAHEAD,
+    transient_ratio: float = CUT_TRANSIENT_RATIO,
+) -> tuple[list[int], int]:
+    """Which samples open a new shot, and how many excursions were refused as not-edits.
+
+    The sample grid is 7.5 Hz, so this can only say "the edit is somewhere in this eighth of a second";
+    `refine_cut_frames` then puts it on a frame. What this adds over walking the distances once is the
+    view forward: a strobe, a muzzle flash or a two-frame insert spikes the histogram and comes straight
+    back to the shot it interrupted, and a cut here costs three things — the sticky speaker is dropped,
+    the object identities are cleared, and the camera re-aims at a frame nobody would call a shot. Only
+    reading the distances in order cannot see that the excursion returns.
+    """
+    min_gap_f = max(1, int(fps * min_shot_sec))
+    out: list[int] = []
+    refused = 0
+    last_f = sample_frames[0] if sample_frames else 0
+    seen = next((i for i, h in enumerate(hists) if h is not None), None)
+    k = 1
+    while k < len(hists):
+        if hists[k] is not None and seen is not None:
+            spike = _hist_distance(cv2, hists[seen], hists[k])
+            if spike > thr and (sample_frames[k] - last_f) >= min_gap_f:
+                returned = _excursion_returns(
+                    cv2, hists, seen, k, spike, thr, transient_ratio, lookahead
+                )
+                if returned is None:
+                    out.append(k)
+                    last_f = sample_frames[k]
+                else:
+                    # The flash *ending* is not a second edit. Restarting the scan there, rather than
+                    # comparing the flash against the frame before it, is what stops one strobe from
+                    # buying the camera two re-aims.
+                    refused += 1
+                    k = returned
+        if hists[k] is not None:
+            seen = k
+        k += 1
+    return out, refused
+
+
+def _excursion_returns(
+    cv2, hists: list[Any], anchor: int, k: int, spike: float, thr: float, ratio: float,
+    lookahead: int,
+) -> int | None:
+    """The sample that is the shot from before the spike again, or None if nothing came back.
+
+    An excursion has to be over *and* the frame it returned to has to be the shot that was left behind,
+    not merely another bright one; a cut to a new scene keeps drifting away from its anchor.
+    """
+    for later in range(k + 1, min(len(hists), k + 1 + lookahead)):
+        if hists[later] is None:
+            continue
+        back = _hist_distance(cv2, hists[anchor], hists[later])
+        if back < thr and back < ratio * spike:
+            return later
+    return None
+
+
+def refine_cut_frames(
+    cv2,
+    hists: list[Any],
+    boundaries: list[int],
+    sample_frames: list[int],
+    thr: float,
+    first_frame: int,
+) -> list[int]:
+    """Put each boundary on the frame the edit happens on, using the frames the first pass decoded.
+
+    A cut stamped up to one sample interval late is not a rounding error: the export interpolates up to
+    the frame before the flag and hard-switches there, so the first ~0.1 s of the new shot is still
+    framed for the old one, which is exactly when the viewer's eye is checking where the subject went.
+    Landing the switch on the frame instead moves the layout boundary with it. Measured on the
+    ghost-hunter footage against an independent frame-exact scan: median error 42 ms -> 0 ms, mean
+    47 ms -> 7 ms, and 106 of 112 edits land on the exact frame.
+
+    `hists` carries every decoded frame rather than only the sampled ones, which is what makes this
+    affordable. Signing the frames the grid steps over costs 1.6x on the histogram pass (4.3 -> 6.8
+    ms/frame on this file); walking the same window a second time measured about 2x on top of a pass
+    that had already run. The decode is the expensive part, so a frame already in hand is cheaper to
+    measure than one somebody has to seek back to.
+    """
+    out: list[int] = []
+    for k in boundaries:
+        anchor_f, cut_f = sample_frames[k - 1], sample_frames[k]
+        anchor = _hist_at(hists, anchor_f, first_frame)
+        edge = cut_f
+        if anchor is not None:
+            for f in range(anchor_f + 1, cut_f + 1):
+                frame_hist = _hist_at(hists, f, first_frame)
+                if frame_hist is not None and _hist_distance(cv2, anchor, frame_hist) > thr:
+                    edge = f
+                    break
+        out.append(edge)
+    return out
+
+
+def _hist_at(hists: list[Any], frame_index: int, first_frame: int) -> Any:
+    offset = frame_index - first_frame
+    return hists[offset] if 0 <= offset < len(hists) else None
+
+
+def _decoded_frames(cap, start_f: int, end_f: int):
+    """Yield every frame from `start_f` on, walking the decoder forward.
+
+    Phase A signs the frames the sample grid would have stepped over. `read()` is what costs money
+    here, so a frame already in hand is cheaper to measure than to seek back to later, and the walk
+    stops at the first failed read — the caller's histogram list is indexed by frame number, so it
+    has to stay a contiguous run from `start_f`.
+    """
+    idx = start_f
+    while idx < end_f:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return
+        yield idx, frame
+        idx += 1
+
+
 def _sampled_frames(cap, start_f: int, end_f: int, stride: int):
     """Yield every `stride`-th frame from `start_f` on, walking the decoder forward.
 
     One seek lands the decoder on the first sample; after that `grab()` steps over the frames the
     sample does not want without paying the BGR copy `read()` does. Seeking per sample measured
-    ~45 ms/frame against ~2 ms for a grab on this footage, and the analysis runs the walk twice.
+    ~45 ms/frame against ~2 ms for a grab on this footage.
     """
     idx = start_f
     while idx < end_f:
@@ -1648,26 +1891,34 @@ def analyze_video_with_openshorts(
     # --- Phase A: read this video's own editing rhythm before deciding anything about the camera ---
     # Only histograms and small-frame motion here, so the expensive detector pass can start from
     # numbers measured on the footage instead of from a constant someone typed in.
+    #
+    # Every frame is decoded and signed, not just the sampled ones. It costs 1.6x on this pass (4.3 ->
+    # 6.8 ms/frame), which buys an edit placed on a frame instead of on an eighth of a second; the
+    # alternative measured earlier — a second walk that seeks back to each boundary — cost about the
+    # same and needed a second decoder. This is the pass that only ever resizes to 64x36, and the
+    # detector walk below is where the analysis actually spends its time.
     hists: list[Any] = []
+    decoded_hists: list[Any] = []
     motions: list[float] = []
     grays: list[float] = []
     sats: list[float] = []
     bottom_graphics: list[bool] = []
-    prev_hist = None
     prev_gray = None
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
     decoded_a = 0
     try:
-        for f_idx, frame in _sampled_frames(cap, start_f, end_f, stride):
+        for f_idx, frame in _decoded_frames(cap, start_f, end_f):
             if is_cancelled is not None and is_cancelled():
                 raise InterruptedError("Video analysis cancelled")
             decoded_a += 1
             if progress_cb is not None and decoded_a % 10 == 0:
-                progress_cb(0.35 * decoded_a / max(1, len(sample_frames)))
+                progress_cb(0.35 * decoded_a / max(1, end_f - start_f))
             small = cv2.resize(frame, (64, 36))
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-            hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-            cv2.normalize(hist, hist)
+            hist = _histogram_of_hsv(cv2, hsv)
+            decoded_hists.append(hist)
+            if (f_idx - start_f) % stride:
+                continue
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             motions.append(0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean()))
             grays.append(float(gray.mean()))
@@ -1706,17 +1957,13 @@ def analyze_video_with_openshorts(
             if a is not None and b is not None
         ]
     )
-    raw_gaps: list[float] = []
-    last_change_f = sample_frames[0] if sample_frames else start_f
-    prev_hist = None
-    for f_idx, hist in zip(sample_frames, hists):
-        if hist is None:
-            continue
-        if prev_hist is not None and cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA) > cut_thr:
-            if (f_idx - last_change_f) >= int(fps * 0.45):
-                raw_gaps.append((f_idx - last_change_f) / fps)
-                last_change_f = f_idx
-        prev_hist = hist
+    boundaries, transient_refused = shot_boundaries(cv2, hists, sample_frames, fps, cut_thr)
+    cut_frames = refine_cut_frames(cv2, decoded_hists, boundaries, sample_frames, cut_thr, start_f)
+    boundary_frame = dict(zip(boundaries, cut_frames))
+    # Read off the accepted boundaries rather than off a second walk of the same distances, so the
+    # rhythm the camera is tuned to is the same set of edits the camera is re-aimed at.
+    edit_frames = [sample_frames[0], *cut_frames]
+    raw_gaps: list[float] = [(b - a) / fps for a, b in zip(edit_frames, edit_frames[1:])]
 
     black_frames = sum(1 for g in grays if g < 16.0)
     rhythm = signature_of(
@@ -1744,7 +1991,6 @@ def analyze_video_with_openshorts(
     face_widths: list[float] = []
     travel: list[float] = []
     prev_target_x: float | None = None
-    prev_hist = None  # phase A left this on the last sample; the cut pass starts fresh
     last_cut_f = start_f  # the opening sample counts as a cut, so the hold applies from the first second
     cameraman.begin_scene()
     # Who is who, and whose mouth moves when: the tracker's ids are per shot, so a person needs an
@@ -1766,21 +2012,23 @@ def analyze_video_with_openshorts(
             if hist is None:
                 continue
 
-            t = f_idx / fps
             is_cut = (f_idx == start_f)
-            if prev_hist is not None:
-                diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
-                if diff > cut_thr and (f_idx - last_cut_f) >= int(fps * 0.45):
-                    # A new shot always drops the sticky speaker, so the camera aims at whoever is
-                    # actually on screen in it. It only jumps there when the previous shot has been
-                    # held long enough; otherwise the pursuit pans.
-                    tracker.reset()
-                    object_memory.clear()
-                    if (f_idx - last_cut_f) >= min_cut_gap_f:
-                        is_cut = True
-                        last_cut_f = f_idx
-                        cameraman.begin_scene()
-            prev_hist = hist
+            if step in boundary_frame:
+                # A new shot always drops the sticky speaker, so the camera aims at whoever is
+                # actually on screen in it. It only jumps there when the previous shot has been
+                # held long enough; otherwise the pursuit pans.
+                tracker.reset()
+                object_memory.clear()
+                edge_f = boundary_frame[step]
+                if (edge_f - last_cut_f) >= min_cut_gap_f:
+                    is_cut = True
+                    last_cut_f = edge_f
+                    cameraman.begin_scene()
+                    # The sample saw the edit up to one interval after it happened; the frame did not.
+                    # Stamping the cut on the frame it lands on is what stops the render holding the
+                    # outgoing composition across the edit, and the layout boundary moves with it.
+                    f_idx = edge_f
+            t = f_idx / fps
 
             if is_cancelled is not None and is_cancelled():
                 raise InterruptedError("Video analysis cancelled")
@@ -1922,14 +2170,11 @@ def analyze_video_with_openshorts(
     tuning = tune(full_rhythm)
     tuning.keep_measured_camera(camera_tuning)
 
-    if tuning.split_allowed or framing_mode == "split":
-        apply_scene_split_layout(track_points, scene_candidates, orig_w, orig_h)
-    else:
-        # This video never really stages two people side by side, so a 2-up panel would be pointed
-        # at empty air for the whole shot. Keep every frame on one subject.
-        for pt in track_points:
-            if pt["mode"] == "split":
-                pt["mode"], pt["x2"], pt["y2"] = "fill", pt["x"], pt["y"]
+    apply_scene_split_layout(track_points, scene_candidates, orig_w, orig_h)
+    split_evidence = shot_face_evidence(track_points, scene_candidates, orig_w)
+    split_folded = (
+        0 if framing_mode == "split" else enforce_shot_split_evidence(track_points, split_evidence)
+    )
     layout_hold_folded = enforce_layout_hold(track_points, tuning.layout_hold_sec, tuning.split_min_hold_sec)
 
     # The punch-in envelope is cut at 0.2 s; the speaking rule reads 0.4 s windows, and the louder half
@@ -2004,7 +2249,11 @@ def analyze_video_with_openshorts(
         "emphasis_beats": beats,
         "tuning": tuning.as_dict(),
         "scene_cut_threshold": round(cut_thr, 3),
-        "shots_detected": len(raw_gaps),
+        "shots_detected": len(boundaries),
+        "transient_rejected": transient_refused,
+        "cuts_framed": sum(1 for k, f in zip(boundaries, cut_frames) if f != sample_frames[k]),
+        "split_shots_folded": split_folded,
+        "split_shot_evidence": split_evidence,
         "layout_hold_sec": tuning.layout_hold_sec,
         "split_min_hold_sec": tuning.split_min_hold_sec,
         "layout_hold_folded": layout_hold_folded,

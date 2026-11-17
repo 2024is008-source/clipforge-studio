@@ -189,7 +189,7 @@ class TestAnalysisIntegration(unittest.TestCase):
                 self.assertLessEqual(subject["box"][1] + subject["box"][3], 1.000001)
                 self.assertTrue(0 <= subject["confidence"] <= 1)
 
-    def test_two_sampled_walks_share_one_region_inference_per_phase_b_sample(self):
+    def test_phase_a_decodes_every_frame_and_phase_b_walks_the_sample_grid(self):
         self.regions = [
             region((256, 60, 128, 240)),  # Same person as the face: must not duplicate it.
             region((32, 180, 144, 90), "laptop", 0.87, 63),
@@ -197,9 +197,13 @@ class TestAnalysisIntegration(unittest.TestCase):
         result = self.analyze()
         self.capture.assert_called_once_with(VIDEO_PATH, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
         self.assertEqual(self.cap.seeks, [(cv2.CAP_PROP_POS_FRAMES, 20)] * 2)
-        expected = [(phase, i) for phase in (1, 2) for i in range(20, 60, 2)]
-        self.assertEqual(self.cap.reads, expected)
-        self.assertEqual(self.cap.grabs, [(phase, i + 1) for phase, i in expected])
+        # Phase A pays for the read anyway, so it signs the frames the sample grid steps over: that is
+        # what buys a frame-exact cut instead of an eighth-of-a-second one. Phase B, where every frame
+        # costs a detector run, is the pass that has to skip.
+        self.assertEqual(self.cap.reads[:40], [(1, frame) for frame in range(20, 60)])
+        sampled = [(2, frame) for frame in range(20, 60, 2)]
+        self.assertEqual(self.cap.reads[40:], sampled)
+        self.assertEqual(self.cap.grabs, [(2, frame) for frame in range(21, 60, 2)])
         self.assertEqual(self.cap.release_count, 1)
         self.assert_shared_inference(20)
         self.assertEqual([int(c.args[0][0, 0, 0]) for c in self.inference.call_args_list], list(range(20, 60, 2)))

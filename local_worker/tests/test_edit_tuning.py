@@ -48,7 +48,6 @@ class TestPerVideoTuning(unittest.TestCase):
         self.assertAlmostEqual(long_take.layout_hold_sec, 5.0, places=3)
         self.assertAlmostEqual(long_take.tau_x, 0.46, places=3)
         self.assertGreater(long_take.deadband_x, rapid.deadband_x)
-        self.assertFalse(long_take.split_allowed)
 
     def test_a_window_with_no_cuts_is_one_take_not_dialogue(self):
         locked = tune(
@@ -102,7 +101,6 @@ class TestPerVideoTuning(unittest.TestCase):
         self.assertAlmostEqual(dark.tau_x, 0.494, places=3)
         self.assertAlmostEqual(dark.max_speed_y, 0.35, places=3)
         self.assertAlmostEqual(dark.punch_gain, 0.6, places=3)
-        self.assertFalse(dark.split_allowed)
 
 
 class TestAdaptiveSceneCutThreshold(unittest.TestCase):

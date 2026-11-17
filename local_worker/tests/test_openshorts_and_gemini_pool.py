@@ -187,14 +187,47 @@ class TestOpenShortsReframeAndGeminiPool(unittest.TestCase):
     def test_the_camera_never_travels_faster_than_the_pursuit_law_allows(self):
         # A detector that puts the head somewhere else for one sample is a step, not a pan. Smoothing
         # shortens the step; only the rate limit stops the frame from lurching after it.
-        track = [{"t": i / 30.0, "x": 0.5, "y": 0.4, "mode": "fill"} for i in range(30)]
-        for i in range(10, 30):
+        # Two seconds of runway, because a rig that eases in has to cover the move before the shot ends.
+        track = [{"t": i / 30.0, "x": 0.5, "y": 0.4, "mode": "fill"} for i in range(60)]
+        for i in range(10, 60):
             track[i]["x"] = 0.9
-        out = limit_pursuit_rate(track, 0.7, 0.45)
+        out = limit_pursuit_rate(track, 0.7, 0.45, accel_k=3.2)
         self.assertEqual(out[0]["x"], 0.5)  # the shot opens where the cut was made
         steps = [out[i + 1]["x"] - out[i]["x"] for i in range(len(out) - 1)]
         self.assertLessEqual(max(abs(s) for s in steps), 0.7 / 30.0 + 1e-4)
         self.assertAlmostEqual(out[-1]["x"], 0.9, places=2)
+
+    def test_a_pan_eases_in_and_out_instead_of_snapping_to_full_tilt(self):
+        # A cap that lets the rig be at full speed one sample after it was standing still is how a
+        # servo behaves. Acceleration is bounded too, and the framing is settled rather than stopped.
+        track = [{"t": i / 30.0, "x": 0.5, "y": 0.4, "mode": "fill"} for i in range(60)]
+        for i in range(10, 60):
+            track[i]["x"] = 0.9
+        out = limit_pursuit_rate(track, 0.7, 0.45, accel_k=3.2)
+        speeds = [(out[i + 1]["x"] - out[i]["x"]) * 30.0 for i in range(len(out) - 1)]
+        accelerations = [(speeds[i + 1] - speeds[i]) * 30.0 for i in range(len(speeds) - 1)]
+        self.assertLess(speeds[11], 0.7 * 0.5, "the first sample of the pan is already near full tilt")
+        # The 0.2 absorbs the 4-decimal rounding keyframes are written at, not slack in the limit.
+        self.assertLessEqual(max(abs(a) for a in accelerations), 3.2 * 0.7 + 0.2)
+        self.assertLess(abs(speeds[-2]), 0.7 * 0.5)  # it settles on the framing instead of stopping on it
+
+    def test_a_layout_switch_inside_a_shot_carries_the_camera_rather_than_teleports_it(self):
+        # Only a cut is allowed to change the frame instantly. When the editorial rule hands a solo
+        # shot to a split mid-take, the viewer is still watching one continuous frame, and a rig that
+        # jumps to the new composition's opening anchor reads as a glitch, not a decision.
+        track = [{"t": i / 10.0, "x": 0.30, "y": 0.4, "mode": "fill"} for i in range(10)]
+        track += [{"t": (10 + i) / 10.0, "x": 0.70, "y": 0.4, "mode": "split"} for i in range(20)]
+        out = limit_pursuit_rate(track, 0.55, 0.45, accel_k=3.2)
+        self.assertEqual(out[10]["x"], out[9]["x"])  # the switch itself moves nothing
+        self.assertGreater(out[11]["x"], 0.30)  # and the pan away from it is ramped from a standstill
+        steps = [out[i + 1]["x"] - out[i]["x"] for i in range(len(out) - 1)]
+        self.assertLessEqual(max(steps), 0.55 / 10.0 + 1e-4)
+        self.assertAlmostEqual(out[-1]["x"], 0.70, places=2)
+
+        for point in track[15:]:
+            point["cut"] = True
+        cut_out = limit_pursuit_rate(track, 0.55, 0.45, accel_k=3.2)
+        self.assertEqual(cut_out[15]["x"], 0.70)  # a cut does open on the framing it was made to
 
     def test_a_template_change_is_not_smoothed_into_the_shot_before_it(self):
         # Averaging a solo crop with the two panel centres either side of a split invents a framing

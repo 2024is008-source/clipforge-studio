@@ -87,7 +87,6 @@ class EditTuning:
     tau_y: float
     max_speed_x: float
     max_speed_y: float
-    split_allowed: bool
     punch_gain: float
     signature: dict[str, Any] = field(default_factory=dict)
 
@@ -103,7 +102,6 @@ class EditTuning:
             "tau_y": round(self.tau_y, 3),
             "max_speed_x": round(self.max_speed_x, 3),
             "max_speed_y": round(self.max_speed_y, 3),
-            "split_allowed": self.split_allowed,
             "punch_gain": round(self.punch_gain, 3),
             "signature": self.signature,
         }
@@ -199,10 +197,6 @@ def tune(sig: Signature) -> EditTuning:
         tau_x *= 1.3
         max_speed_x *= 0.8
 
-    # Two-up only where the video actually stages two people together; otherwise the panel is empty
-    # air and every fold looks like noise.
-    split_allowed = sig.two_face_share >= 0.12 and sig.median_face_width <= 0.22
-
     deadband_x = 0.08 * (1.35 if style in ("long_take", "static_single_shot") else 1.0)
     if dark:
         deadband_x *= 1.25
@@ -218,7 +212,6 @@ def tune(sig: Signature) -> EditTuning:
         tau_y=0.55 if style != "rapid_multicam" else 0.45,
         max_speed_x=max_speed_x,
         max_speed_y=0.35 if dark else 0.45,
-        split_allowed=split_allowed,
         punch_gain=0.6 if dark else (1.0 if style in ("rapid_multicam", "dialogue_cuts", "action_object") else 0.75),
         signature={
             "median_shot_sec": round(msl, 3),
