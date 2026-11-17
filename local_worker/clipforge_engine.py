@@ -18,6 +18,9 @@ Key upgrades over basic center/face cropping:
 4. split_layout + active_speaker: Verifies true two-shots (>=50% coexistence, >=20% horizontal separation,
    median left/right centres, independent_split IoU <= 0.15) and gates stacking on mouth-movement + 8kHz audio RMS.
 5. Native FFmpeg sendcmd rendering (crop@c) + compact_keyframes + punch_in smoothstep beat zooms + EBU R128 mastering.
+6. focus_rules: the gimbal's attention ladder (active talker > presumed host > reaction hold > object >
+   tracker), smoothstep handoff glides, gaze lead-room and calm-shot breathing drift — written into the
+   same track keyframes the preview smoothsteps and the export sends, so both move identically.
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ from .speaker_priority import (
     visible_by_window,
 )
 from .speaker_priority import WINDOW_SECONDS as SPEAK_WINDOW
+from .focus_rules import apply_gimbal_breathing, direct_speaker_focus
 from .layout_decision import foreground_humans
 from .tuning import EditTuning, signature_of, tune
 
@@ -2215,6 +2219,12 @@ def analyze_video_with_openshorts(
     )
     speakers.update(registry.report(main_key))
     speakers["behavior"] = behavior_report
+    # Where the camera's attention rests inside the chosen composition: the focus rule ladder
+    # (active talker, presumed host, reaction hold, object, tracker) with eased handoffs.
+    speakers["focus"] = direct_speaker_focus(
+        track_points, samples, talks, main_key, orig_w, orig_h,
+        behaviors=behavior_report["behavior_by_sample"],
+    )
     from .layout_decision import LayoutPolicy, anchor_solo_subjects, finalize_layouts
 
     layout_policy = LayoutPolicy.from_environment(tuning.layout_hold_sec)
@@ -2226,6 +2236,9 @@ def analyze_video_with_openshorts(
     delivered = limit_pursuit_rate(
         smooth_trajectory_zero_phase(track_points), tuning.max_speed_x, tuning.max_speed_y
     )
+    # The calm-shot drift is part of the delivered motion, so the coverage guarantees below are
+    # measured on the track the viewer actually gets, drift included.
+    delivered = apply_gimbal_breathing(delivered, tuning.style)
     layouts = finalize_layouts(delivered, samples, orig_w, orig_h, talks, main_key, framing_mode,
                                layout_policy, behaviors=behavior_report["behavior_by_sample"])
     if layouts:

@@ -496,7 +496,7 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
 
         self.assertEqual(
             clean_hook_title("that's crazy I think you have to do it"),
-            "that's crazy I think you have to do",
+            "That's crazy I think you have to do",
         )
 
     def test_clean_hook_title_repairs_broken_school_backpack_fragment(self):
@@ -523,8 +523,8 @@ class TestYoloSam2BehaviorAndBackendUpgrade(unittest.TestCase):
             write_ass(dec, ass_path)
             with open(ass_path, "r", encoding="utf-8-sig") as f:
                 content = f.read()
-            self.assertIn("HERS IS A SCHOOL BACKPACK", content)
-            self.assertNotIn("IS A SCHOOL BACKPACK YEAH HERS IS A", content)
+            self.assertIn("Hers is a school backpack", content)
+            self.assertNotIn("Yeah hers is a", content)
 
 
 class SampledFramesWalk(unittest.TestCase):

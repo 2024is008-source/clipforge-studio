@@ -175,6 +175,10 @@ class TestAnalysisIntegration(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["track"])
         self.assertEqual([p["t"] for p in result["track"]], [d["t"] for d in result["detections"]])
+        # The focus director names the rule behind every delivered keyframe, and its report
+        # accounts for all of them — the attention ladder ran on the track the viewer gets.
+        self.assertEqual(sum(result["speakers"]["focus"]["rules"].values()), len(result["track"]))
+        self.assertTrue(all(p.get("focusRule") for p in result["track"]))
         for point in result["track"]:
             for axis in ("x", "y", "x2", "y2", "x3", "y3"):
                 if axis in point:
