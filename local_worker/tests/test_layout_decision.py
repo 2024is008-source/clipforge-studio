@@ -2,7 +2,7 @@ import copy
 import unittest
 
 from local_worker.layout_decision import LayoutPolicy, WEIGHTS, anchor_solo_subjects, finalize_layouts, foreground_humans
-from local_worker.speaker_priority import TalkWindow
+from local_worker.speaker_priority import WINDOW_SECONDS, TalkWindow
 
 
 class LayoutDecisionTests(unittest.TestCase):
@@ -183,13 +183,66 @@ class LayoutDecisionTests(unittest.TestCase):
         report = finalize_layouts(points, samples, 1920, 1080, {}, None)
         self.assertEqual(report[0]["layout"], "fit")
 
-    def test_group_reactions_preserved_when_one_person_holds_floor(self):
+    def test_solo_floor_holder_is_focused_even_with_spread_bystanders(self):
+        # The reference edit crops to whoever holds the floor: one attributed speaker becomes a fill
+        # close-up even when silent bystanders stand across the frame, instead of a blurred wide card.
         talks = {i: TalkWindow(frozenset({1}), False, True) for i in range(5)}
         points, _ = self.decide([
             {"key": i, "kind": "face", "box": [200 + i * 650, 270, 140, 180], "confidence": .93}
             for i in range(3)
         ], talks=talks)
-        self.assertEqual(points[0]["mode"], "fit")
+        self.assertEqual(points[0]["mode"], "fill")
+
+    def test_separated_two_talkers_stack_as_split_with_stable_anchors(self):
+        talks = {i: TalkWindow(frozenset({0, 1}), False, True) for i in range(5)}
+        points = [{"t": i * .2, "x": .5, "y": .32, "cut": i == 0} for i in range(10)]
+        points, report = self.decide([
+            {"key": 0, "kind": "face", "box": [300, 250, 140, 180], "confidence": .95},
+            {"key": 1, "kind": "face", "box": [1450, 250, 140, 180], "confidence": .95},
+        ], points=points, talks=talks)
+        self.assertEqual(points[0]["mode"], "split")
+        self.assertEqual(report[0]["reason"], "speaker_focus")
+        self.assertTrue(report[0]["candidates"]["split"]["eligible"])
+        # Panel centres are pinned to the two heads and stay distinct across the whole shot.
+        self.assertTrue(all(p["x"] < p["x2"] for p in points))
+        self.assertEqual(len({(p["x"], p["x2"]) for p in points}), 1)
+
+    def test_adjacent_two_talkers_hold_one_fill_two_shot(self):
+        talks = {i: TalkWindow(frozenset({0, 1}), False, True) for i in range(5)}
+        points, report = self.decide([
+            {"key": 0, "kind": "face", "box": [820, 250, 140, 180], "confidence": .95},
+            {"key": 1, "kind": "face", "box": [980, 250, 140, 180], "confidence": .95},
+        ], talks=talks)
+        self.assertEqual(points[0]["mode"], "fill")
+        self.assertEqual(report[0]["reason"], "speaker_focus")
+
+    def test_single_talker_with_listener_is_not_split(self):
+        talks = {i: TalkWindow(frozenset({0}), False, True) for i in range(5)}
+        points, _ = self.decide([
+            {"key": 0, "kind": "face", "box": [880, 250, 140, 180], "confidence": .95},
+            {"key": 1, "kind": "face", "box": [100, 250, 140, 180], "confidence": .95},
+        ], talks=talks)
+        self.assertEqual(points[0]["mode"], "fill")
+
+    def test_layout_follows_content_across_cuts_despite_long_hold(self):
+        # solo fill -> separated split -> wide fit, each on its own hard cut, must not stay pinned.
+        solo = [{"key": 0, "kind": "face", "box": [900, 250, 150, 190], "confidence": .96}]
+        pair = [{"key": 0, "kind": "face", "box": [300, 250, 140, 180], "confidence": .95},
+                {"key": 1, "kind": "face", "box": [1450, 250, 140, 180], "confidence": .95}]
+        wide = [{"key": i, "kind": "face", "box": [200 + i * 500, 300, 90, 120], "confidence": .9}
+                for i in range(4)]
+        points, samples, talks = [], [], {}
+        for scene, people in enumerate((solo, pair, wide)):
+            keys = frozenset({0}) if scene == 0 else frozenset({0, 1}) if scene == 1 else frozenset()
+            for j in range(6):
+                idx = len(points)
+                t = idx * .2
+                points.append({"t": t, "x": .5, "y": .32, "cut": j == 0})
+                samples.append({"t": t, "people": copy.deepcopy(people)})
+                talks[int(t / WINDOW_SECONDS)] = TalkWindow(keys, False, True)
+        report = finalize_layouts(points, samples, 1920, 1080, talks, None,
+                                  policy=LayoutPolicy(hold_seconds=30))
+        self.assertEqual([r["layout"] for r in report], ["fill", "split", "fit"])
 
     def test_finalization_preserves_delivered_camera_anchors(self):
         points = [{"t": i * .2, "x": .48, "y": .36, "cut": i == 0} for i in range(10)]

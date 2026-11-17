@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from statistics import mean
+from statistics import mean, median
 from typing import Any
 
 from .rendering.filters import crop_rect
@@ -17,6 +17,10 @@ SOLO_FALLBACK_BEHAVIORS = {"solo_monologue", "emphatic_gesture", "object_demonst
 WIDE_HEAD_FRACTION = 0.055
 BYSTANDER_WIDTH_RATIO = 0.7
 DUPLICATE_HEAD_OVERLAP = 0.25
+# Two heads farther apart than this cannot share one 9:16 fill crop, but each fits its own half-height
+# split panel (which sees ~2x the horizontal span). Below it, a single fill two-shot holds both and is
+# preferred; above it the reference edit stacks the pair as a vertical split.
+SPLIT_SEPARATION = 0.22
 STATIC_HEAD_RATE = 2.0
 STATIC_HEAD_RELATIVE = 0.3
 STATIC_MIN_OBSERVATIONS = 4
@@ -211,6 +215,72 @@ def anchor_solo_subjects(points, samples, talks, main_key, width, height, policy
                 a + (b - a) * fraction for a, b in zip(targets[left], targets[right]))
 
 
+def _speaker_focus(points, samples, talks, origin, width, height, policy):
+    """The speaker set a shot should be framed around, and how to frame it.
+
+    The reference edit crops to whoever holds the floor — one speaker as a full-bleed fill, two as a
+    vertical split when they stand apart or one fill two-shot when adjacent — and only keeps the blurred
+    wide card for genuinely diffuse group/establishing shots. Bystanders are not required content for a
+    speaker crop. The returned set always contains every attributed talker of the shot, so reducing the
+    layout evidence to it can never drop a speaker the coverage guarantee promises to show.
+
+    Returns (keys, anchors, hint): anchors are stable split panel centres when the pair stands apart,
+    else None; hint is "split" or "fill". Returns None when the shot has no clean speaker focus.
+    """
+    n = len(points)
+    if n < 4:
+        return None
+    union: set = set()
+    per_sample: list[tuple[frozenset, tuple[float, float], tuple[float, float]]] = []
+    for point, sample in zip(points, samples):
+        talk = talks.get(int((point["t"] - origin) / WINDOW_SECONDS))
+        keys = frozenset(getattr(talk, "keys", frozenset()))
+        union |= set(keys)
+        humans = foreground_humans(sample.get("people", []), policy.confidence)
+        by_key = {p["key"]: p for p in humans}
+        if len(keys) == 2 and keys <= by_key.keys():
+            pair = sorted(keys, key=lambda k: head_zone(by_key[k])[0])
+        elif (not keys and len(humans) == 2
+              and min(head_zone(p)[2] for p in humans) >= WIDE_HEAD_FRACTION * width):
+            pair = sorted((p["key"] for p in humans), key=lambda k: head_zone(by_key[k])[0])
+        else:
+            continue
+        a, b = by_key[pair[0]], by_key[pair[1]]
+        ha, hb = head_zone(a), head_zone(b)
+        ca = (ha[0] + ha[2] / 2, ha[1] + ha[3] / 2)
+        cb = (hb[0] + hb[2] / 2, hb[1] + hb[3] / 2)
+        per_sample.append((frozenset(pair), ca, cb))
+    if len(union) >= 3:
+        return None
+    if len(union) == 1:
+        keys = frozenset(union)
+        present = 0
+        for point, sample in zip(points, samples):
+            humans = {p["key"]: p for p in foreground_humans(sample.get("people", []), policy.confidence)}
+            if keys <= humans.keys():
+                present += 1
+        if present / n < policy.detection_share:
+            return None
+        return keys, None, "fill"
+    if not per_sample:
+        return None
+    counts: dict[frozenset, int] = {}
+    for pair, _, _ in per_sample:
+        counts[pair] = counts.get(pair, 0) + 1
+    pair = max(counts, key=counts.get)
+    good = [(ca, cb) for p, ca, cb in per_sample if p == pair
+            and (cb[0] - ca[0]) >= SPLIT_SEPARATION * width]
+    adjacent = [(ca, cb) for p, ca, cb in per_sample if p == pair
+                and (cb[0] - ca[0]) < SPLIT_SEPARATION * width]
+    if len(good) / n >= policy.detection_share:
+        lx, ly = median(c[0][0] for c in good) / width, median(c[0][1] for c in good) / height
+        rx, ry = median(c[1][0] for c in good) / width, median(c[1][1] for c in good) / height
+        return pair, [(lx, ly, rx, ry)] * n, "split"
+    if len(adjacent) / n >= policy.detection_share:
+        return pair, None, "fill"
+    return None
+
+
 def _evaluate(mode, points, samples, talks, origin, main_key, width, height, policy, behaviors=None):
     values = {name: [] for name in WEIGHTS}
     reasons = set()
@@ -218,6 +288,9 @@ def _evaluate(mode, points, samples, talks, origin, main_key, width, height, pol
     speaker_missing = 0
     bottom_graphic_hits = 0
     outside_crop_hits = 0
+    split_overlap_hits = 0
+    split_distinct_hits = 0
+    split_subject_hits = 0
     for point, sample in zip(points, samples):
         people = sample.get("people", [])
         w_idx = int((point["t"] - origin) / WINDOW_SECONDS)
@@ -248,12 +321,12 @@ def _evaluate(mode, points, samples, talks, origin, main_key, width, height, pol
                 overlap = _intersection(*rects)
                 iou = overlap / max(1.0, _area(rects[0]) + _area(rects[1]) - overlap)
                 if iou > policy.max_panel_overlap:
-                    reasons.add("overlapping_panels")
+                    split_overlap_hits += 1
                 owners = [{p["key"] for p in humans if _coverage(p, [r]) >= policy.visibility} for r in rects]
                 if not owners[0] or not owners[1] or owners[0] & owners[1]:
-                    reasons.add("panels_not_distinct")
+                    split_distinct_hits += 1
                 if len({p["key"] for p in humans}) != 2:
-                    reasons.add("split_requires_two_subjects")
+                    split_subject_hits += 1
         visible = 1.0 if mode == "fit" else coverage
         conf_humans = foreground_humans(people, policy.confidence)
         wide = len(conf_humans) == 1 and head_zone(conf_humans[0])[2] < WIDE_HEAD_FRACTION * width
@@ -289,6 +362,16 @@ def _evaluate(mode, points, samples, talks, origin, main_key, width, height, pol
             reasons.add("speaker_not_observed")
         if bottom_graphic_hits >= max(1, math.ceil(n_pts * 0.45)):
             reasons.add("preserve_source_graphics")
+    if mode == "split":
+        # Same isolated-frame tolerance as fill: a detector flicker on one sample must not disqualify
+        # a shot that is cleanly a two-shot for the rest of its duration.
+        tol = 0.20 if n_pts >= 4 else 0.0
+        if split_overlap_hits / n_pts > tol:
+            reasons.add("overlapping_panels")
+        if split_distinct_hits / n_pts > tol:
+            reasons.add("panels_not_distinct")
+        if split_subject_hits / n_pts > tol:
+            reasons.add("split_requires_two_subjects")
     components = {key: round(mean(value), 4) if value else 0.0 for key, value in values.items()}
     score = sum(components[key] * weight for key, weight in WEIGHTS.items())
     return {"score": round(score, 4), "components": components, "eligible": not reasons, "reasons": sorted(reasons)}
@@ -312,18 +395,39 @@ def finalize_layouts(points: list[dict[str, Any]], samples: list[dict[str, Any]]
     for scene, (lo, hi) in enumerate(zip(starts, starts[1:])):
         current = points[lo:hi]
         evidence = _without_set_pieces(samples[lo:hi], width)
-        candidates = {mode: _evaluate(mode, current, evidence, talks, origin, main_key, width, height, policy, behaviors)
-                      for mode in ("fill", "split", "fit")}
+        focus = (_speaker_focus(current, evidence, talks, origin, width, height, policy)
+                 if framing_mode == "auto" else None)
+        anchors = None
+        hint = None
+        if focus:
+            keys, anchors, hint = focus
+            # Frame the shot around its speakers: bystanders are not required content for a speaker
+            # crop, so drop them from the layout evidence. The kept set always contains every
+            # attributed talker, which is what the delivered-coverage guarantee promises to show.
+            evidence = [{**s, "people": [p for p in s.get("people", [])
+                                         if p.get("kind") == "object" or p.get("key") in keys]}
+                        for s in evidence]
+        split_points = current
+        if anchors:
+            split_points = [{**p, "x": a[0], "y": a[1], "x2": a[2], "y2": a[3]}
+                            for p, a in zip(current, anchors)]
+        candidates = {"fill": _evaluate("fill", current, evidence, talks, origin, main_key, width, height, policy, behaviors),
+                      "split": _evaluate("split", split_points, evidence, talks, origin, main_key, width, height, policy, behaviors),
+                      "fit": _evaluate("fit", current, evidence, talks, origin, main_key, width, height, policy, behaviors)}
         if framing_mode == "auto":
             viable = [mode for mode in candidates if candidates[mode]["eligible"]]
-            chosen = max(viable, key=lambda mode: candidates[mode]["score"])
-            reason = "highest_safe_score"
+            if hint and hint in viable:
+                # The reference edit crops to whoever holds the floor; honour that composition whenever
+                # it is safe instead of letting the blurred wide card win on a flat context score.
+                chosen, reason = hint, "speaker_focus"
+            else:
+                chosen = max(viable, key=lambda mode: candidates[mode]["score"])
+                reason = "highest_safe_score"
             if previous in viable and chosen != previous:
-                # Never stay trapped in safety-fallback `fit` across a hard scene cut onto a cleanly
-                # tracked portrait/split shot; hold only prevents oscillation between portrait layouts.
-                if previous == "fit" and chosen in ("fill", "split") and current[0].get("cut"):
-                    pass
-                else:
+                # A hard cut is an edit point: the new shot's composition wins outright, so the layout
+                # follows the content (solo crop / two-up / wide bed) instead of staying pinned. Hold and
+                # hysteresis only damp oscillation inside continuous, un-cut footage.
+                if not current[0].get("cut"):
                     holding = current[0]["t"] - switched_at < policy.hold_seconds
                     marginal = candidates[chosen]["score"] - candidates[previous]["score"] < policy.switch_margin
                     if holding or marginal:
@@ -338,6 +442,9 @@ def finalize_layouts(points: list[dict[str, Any]], samples: list[dict[str, Any]]
             failed = sorted({r for mode in ("fill", "split") for r in candidates[mode]["reasons"]})
             if failed:
                 reason = ",".join(failed)
+        if chosen == "split" and anchors:
+            for point, a in zip(current, anchors):
+                point["x"], point["y"], point["x2"], point["y2"] = a
         for point in current:
             point["mode"] = chosen
             point["layoutDecision"] = {"scene": scene, "reason": reason}
