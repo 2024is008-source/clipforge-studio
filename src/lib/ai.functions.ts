@@ -1,16 +1,30 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-// Strict Architecture Enforcement (OpenShorts v2 + 5-Key Gemini Pool):
+// Strict Architecture Enforcement (OpenShorts v2 + Adaptive Gemini Key Pool):
 // - Speech transcription is NEVER performed in cloud functions (100% handled by local faster-whisper worker).
-// - Supports up to 5 Google Gemini Free Tier API keys (GEMINI_API_KEY_1 .. GEMINI_API_KEY_5) with
-//   round-robin job distribution and automatic 429/quota failover rotation to maximize video quality.
+// - Supports up to 5 Google Gemini API keys (GEMINI_API_KEY_1 .. GEMINI_API_KEY_5) with health-aware
+//   round-robin distribution: rate-limited keys cool down, auth/permission-broken keys are skipped,
+//   transient (503/timeout/network) failures retry with backoff then rotate to the next key.
 
 const FREE_TIER_ONLY = (process.env["FREE_TIER_ONLY"] ?? "true").toLowerCase() !== "false";
 let activeGeminiRequests = 0;
 let roundRobinCounter = 0;
 
+// Pool tuning (overridable via env).
+const GEMINI_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env["GEMINI_REQUEST_TIMEOUT_MS"] ?? 45_000));
+const GEMINI_MAX_ATTEMPTS_PER_KEY = Math.max(1, Number(process.env["GEMINI_MAX_ATTEMPTS_PER_KEY"] ?? 2));
+const GEMINI_RATE_LIMIT_COOLDOWN_MS = Math.max(5_000, Number(process.env["GEMINI_RATE_LIMIT_COOLDOWN_MS"] ?? 60_000));
+const GEMINI_TRANSIENT_BACKOFF_MS = [700, 1_600];
+
 const keyCooldownUntil = new Map<string, number>();
+// Keys that failed with auth/permission errors (bad key, project has no free tier, billing off).
+const keyDisabled = new Set<string>();
+const keyFailStreak = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export function maskApiKey(key: string): string {
   const k = (key || "").trim();
@@ -49,19 +63,51 @@ export function getConfiguredGeminiKeys(overrideKeys?: string[]): string[] {
   return unique.slice(0, 5);
 }
 
+export type GeminiErrorKind = "rate_limit" | "invalid_key" | "project_blocked" | "transient" | "fatal";
+
+/** Categorize a Gemini failure so the pool can pick the right recovery (cooldown / skip / retry / abort). */
+export function classifyGeminiError(err: unknown): { kind: GeminiErrorKind; message: string; status: number | undefined } {
+  const message = err instanceof Error ? err.message : String(err);
+  const up = message.toUpperCase();
+  const m = up.match(/\b([45]\d\d)\b/);
+  const status = m ? Number(m[1]) : undefined;
+  // Rate limit / quota: same key usable again after cooldown, try other keys now.
+  if (/\b429\b|RESOURCE_EXHAUSTED|RATE.?LIMIT|QUOTA|TOO MANY REQUESTS/.test(up)) return { kind: "rate_limit", message, status };
+  // Content-policy / safety blocks are not key problems — do not rotate or retry.
+  if (/PROHIBITED_CONTENT|BLOCKED_BY_SAFETY|SAFETY|RECITATION|CONTENT POLICY|BLOCKED_REASON/.test(up)) return { kind: "fatal", message, status };
+  // Malformed key / auth rejection: this key will never work, disable it.
+  if (/\b401\b|UNAUTHENTICATED|API_KEY_INVALID|INVALID_API_KEY|API KEY (IS )?(INVALID|NOT VALID)|KEY NOT VALID|REQUEST HEADER.*API KEY/.test(up))
+    return { kind: "invalid_key", message, status };
+  // Project has no free tier / billing disabled / permission denied: this key's project is unusable.
+  // The SDK wraps HTTP 403 as "Non-retryable exception Forbidden sending request" with no numeric code,
+  // so match the Forbidden/Permission wording, not just "403".
+  if (/\b403\b|PERMISSION_DENIED|FORBIDDEN|ACCESS_DENIED|FREE TIER IS NOT AVAILABLE|NOT AVAILABLE (TO|FOR) (NEW USERS|THIS PROJECT)|SET UP BILLING|UPGRADE TO THE PAID/.test(up))
+    return { kind: "project_blocked", message, status };
+  // Server-side overload / temporary outage / deadline: retry same key, then rotate.
+  if (/\b(500|502|503|504)\b|UNAVAILABLE|HIGH DEMAND|DEADLINE_EXCEEDED|INTERNAL.?SERVER|OVERLOADED|TRY AGAIN|TEMPORARILY|GATEWAY TIMEOUT|BAD GATEWAY|RETRYABLE HTTP/.test(up))
+    return { kind: "transient", message, status };
+  // Network / timeout / aborted fetch: treat as transient (this was the HTTP 000 hang).
+  if (/TIMEOUT|TIMED OUT|ABORT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|SOCKET|NETWORK|FETCH FAILED|CLOSED|UND_ERR/.test(up))
+    return { kind: "transient", message, status };
+  // Everything else (400 bad request, JSON parse, unexpected) — surface it, don't churn the pool.
+  return { kind: "fatal", message, status };
+}
+
+/**
+ * True when switching to a different key (or retrying) can plausibly help.
+ * Rate limits, disabled/blocked keys, and transient errors are all "worth another key";
+ * content-policy and other fatal errors are not.
+ */
 export function isGeminiKeyRetryable(err: unknown): boolean {
-  const msg = (err instanceof Error ? err.message : String(err)).toUpperCase();
-  return [
-    "429",
-    "RESOURCE_EXHAUSTED",
-    "RATE LIMIT",
-    "QUOTA",
-    "401",
-    "403",
-    "API_KEY",
-    "API KEY",
-    "PERMISSION_DENIED",
-  ].some((tok) => msg.includes(tok));
+  const kind = classifyGeminiError(err).kind;
+  return kind === "rate_limit" || kind === "invalid_key" || kind === "project_blocked" || kind === "transient";
+}
+
+/** Clear learned key health so the next request re-probes every configured slot (call on key save / manual re-check). */
+export function resetGeminiKeyHealth(): void {
+  keyCooldownUntil.clear();
+  keyDisabled.clear();
+  keyFailStreak.clear();
 }
 
 function getConfiguredGeminiModel(): string {
@@ -73,7 +119,7 @@ export type GeminiKeySlotStatus = {
   envName: string;
   configured: boolean;
   masked: string;
-  status: "ready" | "rate_limited" | "empty";
+  status: "ready" | "rate_limited" | "blocked" | "empty";
 };
 
 export type GeminiStatusInfo = {
@@ -96,21 +142,28 @@ export const getGeminiConfigStatus = createServerFn({ method: "GET" }).handler(a
     const raw = (process.env[envName] || (i === 1 ? process.env["GEMINI_API_KEY"] : "") || "").trim();
     const configured = raw.length > 10;
     const cooldown = configured ? (keyCooldownUntil.get(raw) ?? 0) : 0;
+    let status: GeminiKeySlotStatus["status"] = "empty";
+    if (configured) {
+      if (keyDisabled.has(raw)) status = "blocked";
+      else if (cooldown > now) status = "rate_limited";
+      else status = "ready";
+    }
     slots.push({
       slot: i,
       envName,
       configured,
       masked: configured ? maskApiKey(raw) : "Not set",
-      status: !configured ? "empty" : cooldown > now ? "rate_limited" : "ready",
+      status,
     });
   }
   const keys = getConfiguredGeminiKeys();
-  const maxConcurrent = Math.max(1, Number(process.env["GEMINI_MAX_CONCURRENT_REQUESTS"] || String(Math.max(1, keys.length))));
+  const healthyKeyCount = keys.filter((k) => !keyDisabled.has(k)).length;
+  const maxConcurrent = Math.max(1, Number(process.env["GEMINI_MAX_CONCURRENT_REQUESTS"] || String(Math.max(1, healthyKeyCount))));
   return {
     apiKeyConfigured: keys.length > 0,
     configuredKeyCount: keys.length,
     maxKeySlots: 5,
-    effectiveThroughputMultiplier: Math.max(1, keys.length),
+    effectiveThroughputMultiplier: Math.max(1, healthyKeyCount),
     model: getConfiguredGeminiModel(),
     freeTierOnly: FREE_TIER_ONLY,
     maxConcurrentRequests: maxConcurrent,
@@ -253,36 +306,87 @@ Apply OpenShorts' strict editing rules:
 Return strict JSON \`{ "clips": [...] }\`.`;
 
 /**
- * Execute a Gemini SDK call rotating across the 5-key pool (round-robin start + automatic 429 failover).
+ * Create a Gemini client for one key with a hard per-request timeout.
+ * The SDK's own retries are disabled so timing is governed entirely by the pool loop below.
+ */
+async function createGeminiClient(apiKey: string) {
+  const { GoogleGenAI } = await import("@google/genai");
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: { timeout: GEMINI_REQUEST_TIMEOUT_MS, retryOptions: { attempts: 1 } },
+  });
+}
+
+/**
+ * Execute a Gemini call across the healthy key pool:
+ * - round-robin start over keys not permanently disabled,
+ * - cooldown keys tried last,
+ * - transient failures retried per key with backoff,
+ * - rate-limited keys cooled down and skipped, broken keys disabled,
+ * - fatal (content-policy / request) errors abort immediately.
  */
 async function executeWithGeminiKeyPool<T>(
   keys: string[],
   runner: (apiKey: string, keySlotIndex: number) => Promise<T>
 ): Promise<{ result: T; usedKeySlot: number }> {
+  if (!keys.length) {
+    throw new Error("No Gemini API keys configured. Add up to 5 keys (GEMINI_API_KEY_1..5) in Settings → AI & Processing.");
+  }
   const now = Date.now();
-  const startIdx = roundRobinCounter++ % keys.length;
-  const rotated = [...keys.slice(startIdx), ...keys.slice(0, startIdx)];
-  const ready = rotated.filter((k) => (keyCooldownUntil.get(k) ?? 0) <= now);
-  const ordered = [...ready, ...rotated.filter((k) => !ready.includes(k))];
+  const usable = keys.map((key, i) => ({ key, slot: i + 1 })).filter((e) => !keyDisabled.has(e.key));
+  if (!usable.length) {
+    throw new Error(
+      `All ${keys.length} configured Gemini key(s) are disabled after repeated auth/permission errors. Re-check them in Settings → AI & Processing.`
+    );
+  }
+  const startIdx = roundRobinCounter++ % usable.length;
+  const rotated = [...usable.slice(startIdx), ...usable.slice(0, startIdx)];
+  const ordered = [
+    ...rotated.filter((e) => (keyCooldownUntil.get(e.key) ?? 0) <= now),
+    ...rotated.filter((e) => (keyCooldownUntil.get(e.key) ?? 0) > now),
+  ];
 
   let lastError: unknown = null;
-  for (let i = 0; i < ordered.length; i++) {
-    const key = ordered[i]!;
-    const slotNum = keys.indexOf(key) + 1;
-    try {
-      const result = await runner(key, slotNum);
-      keyCooldownUntil.delete(key);
-      return { result, usedKeySlot: slotNum };
-    } catch (err) {
-      lastError = err;
-      if (isGeminiKeyRetryable(err)) {
-        keyCooldownUntil.set(key, Date.now() + 60_000);
-        continue;
+  for (const { key, slot } of ordered) {
+    for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS_PER_KEY; attempt++) {
+      try {
+        const result = await runner(key, slot);
+        keyCooldownUntil.delete(key);
+        keyFailStreak.delete(key);
+        return { result, usedKeySlot: slot };
+      } catch (err) {
+        lastError = err;
+        const { kind } = classifyGeminiError(err);
+        if (kind === "fatal") throw err;
+        if (kind === "invalid_key" || kind === "project_blocked") {
+          keyDisabled.add(key);
+          keyFailStreak.set(key, (keyFailStreak.get(key) ?? 0) + 1);
+          break; // permanently skip this key, rotate
+        }
+        if (kind === "rate_limit") {
+          keyCooldownUntil.set(key, Date.now() + GEMINI_RATE_LIMIT_COOLDOWN_MS);
+          break; // usable again after cooldown, try another key now
+        }
+        // transient: short backoff then retry the same key, and rotate once attempts are spent
+        if (attempt < GEMINI_MAX_ATTEMPTS_PER_KEY) {
+          const backoff = GEMINI_TRANSIENT_BACKOFF_MS[attempt - 1] ?? 1_500;
+          await sleep(backoff);
+          continue;
+        }
+        keyFailStreak.set(key, (keyFailStreak.get(key) ?? 0) + 1);
+        break;
       }
-      throw err;
     }
   }
-  throw lastError ?? new Error("All configured Gemini API keys in the 5-key pool are exhausted.");
+
+  const { kind, message } = classifyGeminiError(lastError ?? new Error("unknown"));
+  if (kind === "rate_limit") {
+    throw new Error(`All ${ordered.length} healthy Gemini key(s) hit HTTP 429 / quota limits. ${message}`);
+  }
+  if (kind === "transient") {
+    throw new Error(`Gemini is temporarily unavailable across the pool (overload/timeout). ${message}`);
+  }
+  throw lastError ?? new Error("All configured Gemini API keys in the pool failed.");
 }
 
 export const findViralClips = createServerFn({ method: "POST" })
@@ -298,10 +402,20 @@ export const findViralClips = createServerFn({ method: "POST" })
         );
       }
 
-      const maxConcurrent = Math.max(1, keys.length);
+      const healthyKeys = keys.filter((k) => !keyDisabled.has(k));
+      if (!healthyKeys.length) {
+        return {
+          clips: [],
+          quotaExhausted: true,
+          totalPoolKeys: keys.length,
+          error: `All ${keys.length} configured Gemini key(s) are disabled after repeated auth/permission errors. Verify them in Settings → AI & Processing — Local Smart Discovery has been engaged automatically.`,
+        };
+      }
+
+      const maxConcurrent = Math.max(1, healthyKeys.length);
       if (activeGeminiRequests >= maxConcurrent) {
         throw new Error(
-          `Concurrency limit (${maxConcurrent} across ${keys.length} key(s)) reached. Please wait a moment.`
+          `Concurrency limit (${maxConcurrent} across ${healthyKeys.length} healthy key(s)) reached. Please wait a moment.`
         );
       }
 
@@ -311,9 +425,8 @@ export const findViralClips = createServerFn({ method: "POST" })
 
       activeGeminiRequests++;
       try {
-        const { GoogleGenAI } = await import("@google/genai");
         const { result: text, usedKeySlot } = await executeWithGeminiKeyPool(keys, async (apiKey) => {
-          const ai = new GoogleGenAI({ apiKey });
+          const ai = await createGeminiClient(apiKey);
           const response = await ai.models.generateContent({
             model: modelName,
             contents: [{ role: "user", parts: [{ text: `${OPENSHORTS_DIRECTOR_PROMPT}\n\n${userPrompt}` }] }],
@@ -335,13 +448,13 @@ export const findViralClips = createServerFn({ method: "POST" })
           totalPoolKeys: keys.length,
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/429|quota|RESOURCE_EXHAUSTED|rate limit/i.test(msg)) {
+        const { kind, message } = classifyGeminiError(err);
+        if (kind === "rate_limit" || kind === "project_blocked" || kind === "invalid_key" || kind === "transient") {
           return {
             clips: [],
-            quotaExhausted: true,
+            quotaExhausted: kind === "rate_limit" || kind === "transient",
             totalPoolKeys: keys.length,
-            error: `All ${keys.length} configured Gemini Free Tier key(s) hit HTTP 429 rate limits. Your local Whisper transcript is safely preserved — Local Smart Discovery has been engaged automatically.`,
+            error: `Gemini viral discovery is temporarily unavailable (${kind}). Your local Whisper transcript is safely preserved — Local Smart Discovery has been engaged automatically. ${message}`.slice(0, 600),
           };
         }
         throw err;
@@ -376,9 +489,8 @@ export const parseCampaignBrief = createServerFn({ method: "POST" })
       throw new Error("No Gemini API keys configured for campaign brief extraction.");
     }
     const prompt = `Extract structured clipping campaign rules from this campaign brief. Return strict JSON matching: { "campaignName": string, "platforms": string[], "minDurationSec": number, "maxDurationSec": number, "requiredHashtags": string[], "requiredMentions": string[], "requiredDisclosure": string, "requiredCta": string, "prohibitedPhrases": string[], "rightsNotice": string }.\n\nBrief:\n${data.briefText}`;
-    const { GoogleGenAI } = await import("@google/genai");
     const { result: text } = await executeWithGeminiKeyPool(keys, async (apiKey) => {
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = await createGeminiClient(apiKey);
       const res = await ai.models.generateContent({
         model: getConfiguredGeminiModel(),
         contents: [{ role: "user", parts: [{ text: prompt }] }],

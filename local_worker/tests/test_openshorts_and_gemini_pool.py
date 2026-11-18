@@ -252,7 +252,7 @@ class TestOpenShortsReframeAndGeminiPool(unittest.TestCase):
                 "AIzaSyTestKeySlot4_abcdefghijk",
                 "AIzaSyTestKeySlot5_abcdefghijk",
             ],
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash",
             parallel_workers=5,
         )
         self.assertEqual(status["configured_count"], 5)

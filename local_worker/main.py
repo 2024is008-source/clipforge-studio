@@ -200,20 +200,72 @@ def update_gemini_keys_pool(payload: GeminiPoolUpdatePayload):
     return save_key_slots(payload.keys, model=payload.model, parallel_workers=payload.parallel_workers)
 
 
+def _probe_gemini_key(key: str, model: str) -> tuple[bool, str | None, float]:
+    """Make one live generateContent call and classify the result as ok / rate_limited / blocked / error."""
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(
+        {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word OK."}]}]}
+    ).encode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+    )
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            resp.read()
+            return True, None, (time.monotonic() - t0) * 1000.0
+    except urllib.error.HTTPError as e:
+        code = e.code
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "ignore")
+        except Exception:
+            pass
+        elapsed = (time.monotonic() - t0) * 1000.0
+        up = (detail or "").upper()
+        if code == 429 or "RESOURCE_EXHAUSTED" in up or "QUOTA" in up or "RATE LIMIT" in up:
+            return False, f"429 rate limited/quota", elapsed
+        if code in (401, 403) or "PERMISSION_DENIED" in up or "FREE TIER IS NOT AVAILABLE" in up:
+            return False, f"HTTP {code}: key/project not permitted (check billing/free tier)", elapsed
+        if code in (500, 502, 503, 504) or "UNAVAILABLE" in up or "HIGH DEMAND" in up:
+            return False, f"HTTP {code}: model temporarily unavailable", elapsed
+        return False, f"HTTP {code}: {detail[:140]}", elapsed
+    except Exception as e:  # timeouts / network / DNS
+        return False, f"network/timeout: {str(e)[:140]}", (time.monotonic() - t0) * 1000.0
+
+
 @app.post("/v1/gemini/keys/check", dependencies=[Depends(verify_token)])
 def check_gemini_keys_health():
-    """Validate all configured keys in the 5-key pool and update key-health.json."""
+    """Live-probe every configured key (any AI Studio format: AIza… or AQ…) and update key-health.json."""
     keys = get_configured_gemini_keys()
+    status = get_pool_status()
+    model = status.get("model") or os.environ.get("GEMINI_VIDEO_MODEL") or "gemini-3.5-flash"
+    # flash-lite recovers from 503 far more reliably, so it is a better health probe than the main model.
+    # Only Gemini 3.5+ models: the older gemini-2.x / *-latest aliases are no longer available to new users.
+    probe_models = [model, "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
     for key in keys:
-        t0 = time.monotonic()
-        try:
-            # Validate key format and optionally probe Google Generative Language API if online
-            if not key.startswith("AIza") or len(key) < 25:
-                record_key_outcome(key, ok=False, latency_ms=1.0, error_msg="Key format check: expected AIza... key")
-            else:
-                record_key_outcome(key, ok=True, latency_ms=(time.monotonic() - t0) * 1000.0 + 12.4)
-        except Exception as e:
-            record_key_outcome(key, ok=False, latency_ms=(time.monotonic() - t0) * 1000.0, error_msg=str(e))
+        if not key or len(key.strip()) < 20:
+            record_key_outcome(key, ok=False, latency_ms=1.0, error_msg="Key too short / not set")
+            continue
+        final_ok = False
+        final_err: str | None = None
+        final_ms = 0.0
+        for pm in probe_models:
+            ok, err, ms = _probe_gemini_key(key, pm)
+            final_ok, final_err, final_ms = ok, err, ms
+            if ok:
+                break
+            # Rate limit / transient: try the next model (cheaper/lower-demand) before giving up on this key.
+            if err and ("429" in err or "rate limited" in err or "temporarily unavailable" in err or "timeout" in err):
+                continue
+            break  # hard block (401/403/other) — no point trying other models
+        record_key_outcome(key, ok=final_ok, latency_ms=final_ms, error_msg=final_err)
     return get_pool_status()
 
 

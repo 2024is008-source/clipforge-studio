@@ -143,23 +143,45 @@ def rotated_keys_for_task(offset: int | None = None) -> list[str]:
 
 def is_key_retryable(exc: BaseException | str) -> bool:
     """
-    True when rotating to the next Gemini API key in the 5-key pool is safe and effective.
-    Matches OpenShorts' _gemini_is_key_retryable: rotates on 429/quota/auth errors,
-    never on content policy blocks.
+    True when rotating to the next Gemini API key in the pool is safe and effective.
+    Rotates on rate-limit / auth / permission / transient-server / network errors,
+    never on content-policy blocks (mirrors src/lib/ai.functions.ts classifyGeminiError).
+    The SDK wraps HTTP 403 as "Non-retryable exception Forbidden sending request" with no
+    numeric code, so match the Forbidden/Permission wording too, not just "403".
     """
     msg = str(exc).upper()
+    if any(tok in msg for tok in ("PROHIBITED_CONTENT", "BLOCKED_BY_SAFETY", "RECITATION", "CONTENT POLICY", "BLOCKED_REASON")):
+        return False
     return any(
         tok in msg
         for tok in (
             "429",
             "RESOURCE_EXHAUSTED",
             "RATE LIMIT",
+            "RATE_LIMIT",
             "QUOTA",
             "401",
             "403",
             "API_KEY",
             "API KEY",
             "PERMISSION_DENIED",
+            "FORBIDDEN",
+            "ACCESS_DENIED",
+            "UNAUTHENTICATED",
+            "UNAVAILABLE",
+            "HIGH DEMAND",
+            "GATEWAY TIMEOUT",
+            "RETRYABLE HTTP",
+            "OVERLOADED",
+            "TRY AGAIN",
+            "DEADLINE_EXCEEDED",
+            "TIMEOUT",
+            "ABORT",
+            "ETIMEDOUT",
+            "ECONNRESET",
+            "ECONNREFUSED",
+            "NETWORK",
+            "FETCH FAILED",
         )
     )
 
@@ -291,13 +313,21 @@ def execute_with_key_rotation(
             "No Gemini API key configured. Add up to 5 keys (GEMINI_API_KEY_1..5) in Settings → AI & Processing."
         )
 
-    # Prefer keys not currently in a 60s 429 cooldown
+    # Prefer keys not currently in a 60s 429 cooldown and not in a hard error state (bad key / project blocked)
     health = _load_health()
     now = time.time()
-    ready_keys = [
-        k for k in keys if float(health.get(mask_api_key(k), {}).get("cooldown_until", 0.0) or 0.0) <= now
-    ]
-    ordered_keys = ready_keys + [k for k in keys if k not in ready_keys]
+
+    def _cooldown(k: str) -> float:
+        return float(health.get(mask_api_key(k), {}).get("cooldown_until", 0.0) or 0.0)
+
+    def _is_error(k: str) -> bool:
+        return health.get(mask_api_key(k), {}).get("status") == "error"
+
+    ready_keys = [k for k in keys if not _is_error(k) and _cooldown(k) <= now]
+    cooling_keys = [k for k in keys if not _is_error(k) and _cooldown(k) > now]
+    errored_keys = [k for k in keys if _is_error(k)]
+    # Healthy first, then rate-limited (may have recovered), then known-broken as a last resort.
+    ordered_keys = ready_keys + cooling_keys + errored_keys
 
     last_error: Exception | None = None
     for key_idx, api_key in enumerate(ordered_keys):

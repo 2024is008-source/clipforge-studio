@@ -603,14 +603,18 @@ export function WhisperSettingsPanel({
                           ? "bg-primary/15 text-primary"
                           : statusLabel === "rate_limited"
                             ? "bg-yellow-500/15 text-yellow-400"
-                            : "bg-muted text-muted-foreground"
+                            : statusLabel === "blocked" || statusLabel === "error"
+                              ? "bg-red-500/15 text-red-400"
+                              : "bg-muted text-muted-foreground"
                       }`}
                     >
                       {statusLabel === "healthy" || statusLabel === "ready"
                         ? "Ready"
                         : statusLabel === "rate_limited"
                           ? "Cooldown"
-                          : "Empty"}
+                          : statusLabel === "blocked" || statusLabel === "error"
+                            ? "Blocked"
+                            : "Empty"}
                     </span>
                   </div>
                 );
