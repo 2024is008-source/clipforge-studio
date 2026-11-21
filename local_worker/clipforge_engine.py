@@ -104,6 +104,11 @@ CAM_MAX_SPEED_Y = float(os.environ.get("CAM_MAX_SPEED_Y", "0.45"))
 # needs no constant of its own to mirror: OpenShortsSmoothedCameraman.pursue is a first-order lag, so
 # its velocity is eased by construction and only jolts when the cap truncates it, which it rarely does.
 CAM_ACCEL_K = float(os.environ.get("CAM_ACCEL_K", "3.2"))
+# Width of the zero-phase Gaussian (in samples) that pre-smooths the delivered trajectory before the
+# trapezoid limiter re-ramps it. A ~3-sample detector buzz survives sigma 1.6 and reads as a servo
+# correcting itself mid-pan; widening it to 2.4 sweeps that buzz while the limiter restores the big
+# moves, so pans stay crisp. Zero-phase, so the extra width costs no lookahead lag.
+CAM_SMOOTH_SIGMA = float(os.environ.get("CAM_SMOOTH_SIGMA", "2.4"))
 # How long a shot or layout stays on screen before the edit may change it again comes from
 # tuning.py, measured off this video's own cut rhythm — a single global number is what made fast-cut
 # footage look like it was stuttering and long takes look like they were being punched.
@@ -513,6 +518,10 @@ class SmoothedCameraman:
         self._pending_target: float | None = None
         self._pending_count = 0
         self._snap_pending = False
+        # Whether the camera has actually seen this shot's subject yet. A cut that lands before the
+        # detector locks on must hold its last framing, not snap to a bare centred crop that it then
+        # has to pan out of — that centred-then-slide is what reads as the first move missing.
+        self._has_scene_target = False
 
     def apply_tuning(self, t: "EditTuning") -> None:
         """Take the pursuit law from this video's measured editing rhythm instead of the defaults."""
@@ -538,13 +547,18 @@ class SmoothedCameraman:
         return math.copysign(min(abs(error), eased, limit), error)
 
     def begin_scene(self) -> None:
-        """Reset damping at a scene cut and snap to the first detected subject in the new shot."""
+        """Arm the snap-to-first-subject for a new shot and drop the previous shot's stickiness.
+
+        The framing is deliberately *held*, not reset to the video centre: a cut whose first sample
+        has no lock should keep holding until the subject is found, then snap straight onto it, rather
+        than centring and panning over. The moment a real target arrives the snap branch below takes
+        the frame there in one step, so there is still no headless-torso lag after a cut.
+        """
         self._pending_target = None
         self._pending_count = 0
         self._snap_pending = True
+        self._has_scene_target = False
         self.tracking_safe_zone_radius = self.safe_zone_radius
-        self.current_center_x = self.target_center_x = self.video_width / 2.0
-        self.current_center_y = self.target_center_y = self.video_height / 2.0
 
     def update_target(self, face_box: list[float] | tuple[float, ...] | None) -> None:
         if not face_box:
@@ -569,6 +583,7 @@ class SmoothedCameraman:
 
         if self._snap_pending:
             self._snap_pending = False
+            self._has_scene_target = True
             self._pending_target = None
             self._pending_count = 0
             self.target_center_x = new_center
@@ -586,6 +601,7 @@ class SmoothedCameraman:
             if self._pending_count < self.jump_confirm_frames:
                 return
 
+        self._has_scene_target = True
         self._pending_target = None
         self._pending_count = 0
         self.target_center_x = new_center
@@ -593,7 +609,7 @@ class SmoothedCameraman:
         self.target_anchor_y = new_anchor
 
     def get_crop_box(self, force_snap: bool = False) -> tuple[int, int, int, int]:
-        if force_snap:
+        if force_snap and self._has_scene_target:
             self.current_center_x = self.target_center_x
             self.current_center_y = self.target_center_y
             self.current_anchor_y = self.target_anchor_y
@@ -2326,7 +2342,9 @@ def analyze_video_with_openshorts(
     # guarantees are re-read off this track rather than off the decisions, because a camera that is
     # slowed down is a different camera from the one that was planned.
     delivered = limit_pursuit_rate(
-        smooth_trajectory_zero_phase(track_points), tuning.max_speed_x, tuning.max_speed_y
+        smooth_trajectory_zero_phase(track_points, CAM_SMOOTH_SIGMA),
+        tuning.max_speed_x,
+        tuning.max_speed_y,
     )
     # The calm-shot drift is part of the delivered motion, so the coverage guarantees below are
     # measured on the track the viewer actually gets, drift included.

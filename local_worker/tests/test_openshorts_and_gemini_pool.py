@@ -97,6 +97,25 @@ class TestOpenShortsReframeAndGeminiPool(unittest.TestCase):
         cam.update_target([1420, 200, 160, 200])
         self.assertAlmostEqual(cam.target_center_x, 1500.0)
 
+    def test_cut_without_lock_holds_framing_instead_of_centring(self):
+        """A cut that lands before the detector locks must hold the last framing, not snap to centre."""
+        cam = SmoothedCameraman(1080, 1920, 1920, 1080, fps=30.0)
+        cam.begin_scene()
+        cam.update_target([300, 200, 160, 200])  # snap onto the subject at x=380
+        held_x = cam.current_center_x
+        self.assertAlmostEqual(held_x, 380.0)
+
+        # A cut arrives with no detection yet: the crop holds, it is not centred.
+        cam.begin_scene()
+        box = cam.get_crop_box(force_snap=True)
+        centre = (box[0] + box[2]) / 2.0
+        self.assertLess(abs(centre - held_x), 8.0)  # held, within crop-position rounding
+        self.assertGreater(abs(centre - 960.0), 400.0)  # decisively not the video centre
+
+        # When the new shot's subject is finally seen, the snap takes the frame there in one step.
+        cam.update_target([1300, 200, 160, 200])
+        self.assertAlmostEqual(cam.current_center_x, 1380.0)
+
     def test_split_layout_median_two_shot_and_independence(self):
         left = {"box": [320, 240, 160, 200], "score": 32000}
         right = {"box": [1280, 250, 160, 200], "score": 32000}

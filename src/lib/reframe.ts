@@ -554,6 +554,9 @@ export class OpenShortsSmoothedCameraman {
   private pendingTarget: number | null = null;
   private pendingCount = 0;
   private snapPending = true;
+  // Whether this shot's subject has actually been seen yet. Mirrors the worker: a cut that lands
+  // before the detector locks holds its framing rather than hard-snapping to a stale target.
+  private hasSceneTarget = false;
 
   constructor(public jumpConfirmFrames = 3) {}
 
@@ -586,6 +589,7 @@ export class OpenShortsSmoothedCameraman {
     this.pendingTarget = null;
     this.pendingCount = 0;
     this.snapPending = true;
+    this.hasSceneTarget = false;
     this.trackingSafeZoneRadius = this.safeZoneRadius;
   }
 
@@ -601,6 +605,7 @@ export class OpenShortsSmoothedCameraman {
 
     if (this.snapPending) {
       this.snapPending = false;
+      this.hasSceneTarget = true;
       this.pendingTarget = null;
       this.pendingCount = 0;
       this.targetCenterX = newCenter;
@@ -625,6 +630,7 @@ export class OpenShortsSmoothedCameraman {
       }
     }
 
+    this.hasSceneTarget = true;
     this.pendingTarget = null;
     this.pendingCount = 0;
     this.targetCenterX = newCenter;
@@ -632,7 +638,7 @@ export class OpenShortsSmoothedCameraman {
   }
 
   getCenter(forceSnap = false): { x: number; y: number } {
-    if (forceSnap) {
+    if (forceSnap && this.hasSceneTarget) {
       this.currentCenterX = this.targetCenterX;
       this.currentCenterY = this.targetCenterY;
     } else {
@@ -1283,7 +1289,7 @@ export async function trackFaces(
     }
 
     const fillMode = shot.map((s) => ({ ...s.pt, mode: "fill" as FrameLayoutMode }));
-    const smoothed = smoothShotTrajectory(fillMode, 1.55);
+    const smoothed = smoothShotTrajectory(fillMode, 2.4);
     out.push(...smoothed);
   }
 
