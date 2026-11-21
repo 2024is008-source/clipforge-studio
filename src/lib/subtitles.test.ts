@@ -157,3 +157,26 @@ describe("motion switches", () => {
     }
   });
 });
+
+describe("wordMotion custom easing", () => {
+  const linear = (x: number) => x;
+
+  it("keeps the rest/settle endpoints fixed regardless of curve", () => {
+    for (const ease of [linear, (x: number) => x * x]) {
+      expect(wordMotion("opus", WORD.s - 0.5, WORD, 1, ease).scale).toBe(1);
+      expect(wordMotion("opus", WORD.s + 2, WORD, 1, ease).scale).toBe(1);
+    }
+  });
+
+  it("reshapes the pop mid-window when a curve is supplied", () => {
+    const defaultPop = wordMotion("opus", WORD.s + 0.03, WORD, 1).scale;
+    // A linear ramp is ahead of the slow-start smoothstep this early into the attack.
+    const linearPop = wordMotion("opus", WORD.s + 0.03, WORD, 1, linear).scale;
+    expect(linearPop).toBeGreaterThan(defaultPop);
+    expect(Number.isFinite(linearPop)).toBe(true);
+  });
+
+  it("still lands bounce back on the baseline with a custom curve", () => {
+    expect(wordMotion("bounce", WORD.s + 0.6, WORD, 1, linear).y).toBe(0);
+  });
+});

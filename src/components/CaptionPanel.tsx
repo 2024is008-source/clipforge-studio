@@ -3,9 +3,32 @@ import { Download, Upload, ChevronDown, ChevronUp } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { CurveEditor } from "@/components/CurveEditor";
 import { CAPTION_PRESETS, captionPages, parseSubtitles, serializeSubtitles, type CaptionStyle } from "@/lib/subtitles";
 import { drawCaption, W, H, type ClipSettings } from "@/lib/render";
+import type { MotionPreset } from "@/lib/motion";
 import type { Word } from "@/lib/media";
+
+const MOTION_LABELS: Record<MotionPreset, string> = {
+  smooth: "Smooth",
+  snappy: "Snappy",
+  bounce: "Bounce",
+  custom: "Custom",
+};
+
+function MiniToggle({ label, on, set }: { label: string; on: boolean; set: (v: boolean) => void }) {
+  return (
+    <Button
+      variant={on ? "default" : "outline"}
+      size="sm"
+      aria-pressed={on}
+      className="h-auto px-2.5 py-1 text-[11px]"
+      onClick={() => set(!on)}
+    >
+      {label}
+    </Button>
+  );
+}
 
 function StylePreview({ style, settings }: { style: CaptionStyle; settings: ClipSettings }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -29,7 +52,7 @@ function StylePreview({ style, settings }: { style: CaptionStyle; settings: Clip
     };
     render();
     return () => cancelAnimationFrame(frame);
-  }, [style, settings.highlight, settings.animationStrength, settings.animations]);
+  }, [style, settings.highlight, settings.animationStrength, settings.animations, settings.motion, settings.customCurve, settings.captionUppercase, settings.captionOutline, settings.captionBox]);
   return <canvas ref={ref} width={432} height={192} className="aspect-[9/4] w-full" aria-hidden="true" />;
 }
 
@@ -70,6 +93,38 @@ export function CaptionPanel({ settings, setSettings, words, start, end, title, 
     <label className="block space-y-2 text-xs text-muted-foreground">Motion · {Math.round((settings.animationStrength ?? 1) * 100)}%
       <Slider aria-label="Subtitle motion" disabled={settings.animations === false} min={0} max={1.5} step={0.1} value={[settings.animationStrength ?? 1]} onValueChange={(v) => setSettings({ animationStrength: v[0] ?? 1 })} />
     </label>
+    <div className="space-y-2">
+      <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Pop easing</p>
+      <div className="grid grid-cols-4 gap-1.5">
+        {(Object.keys(MOTION_LABELS) as MotionPreset[]).map((m) => (
+          <Button key={m} variant={settings.motion === m ? "default" : "outline"} size="sm" aria-pressed={settings.motion === m} className="h-auto px-1 py-1.5 text-[11px]" onClick={() => setSettings({ motion: m, ...(m === "custom" && !settings.customCurve ? { customCurve: [0.34, 1.56, 0.64, 1] as const } : {}) })}>
+            {MOTION_LABELS[m]}
+          </Button>
+        ))}
+      </div>
+      {settings.motion === "custom" && (
+        <div className="space-y-1.5 rounded-lg border border-border bg-surface p-2">
+          <CurveEditor value={settings.customCurve ?? [0.34, 1.56, 0.64, 1]} onChange={(b) => setSettings({ customCurve: b })} />
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-mono text-[10px] text-muted-foreground">
+              cubic-bezier({(settings.customCurve ?? [0.34, 1.56, 0.64, 1]).map((n) => n.toFixed(2)).join(", ")})
+            </p>
+            <Button variant="ghost" size="sm" className="h-auto px-2 py-1 text-[11px]" onClick={() => setSettings({ customCurve: [0.34, 1.56, 0.64, 1] })}>reset</Button>
+          </div>
+        </div>
+      )}
+    </div>
+    <div className="space-y-2">
+      <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Caption appearance</p>
+      <div className="flex flex-wrap gap-1.5">
+        <MiniToggle label="UPPERCASE" on={settings.captionUppercase === true} set={(v) => setSettings({ captionUppercase: v })} />
+        <MiniToggle label="Background box" on={settings.captionBox === true} set={(v) => setSettings({ captionBox: v })} />
+      </div>
+      <label className="block space-y-2 text-xs text-muted-foreground">Caption outline · {settings.captionOutline ?? "auto"}px
+        <Slider aria-label="Caption outline width" min={0} max={24} step={1} value={[settings.captionOutline ?? 14]} onValueChange={(v) => setSettings({ captionOutline: v[0] ?? 0 })} />
+      </label>
+    </div>
+
     <div className="flex flex-wrap gap-2">
       <Button variant="outline" size="sm" onClick={() => input.current?.click()}><Upload className="size-3.5" />Import subtitles</Button>
       <Button variant="outline" size="sm" disabled={!words.length} onClick={() => download("srt")}><Download className="size-3.5" />SRT</Button>

@@ -20,7 +20,7 @@ import {
   Sliders,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { YouTubeImport } from "@/components/YouTubeImport";
+import { HELPER, YouTubeImport } from "@/components/YouTubeImport";
 import { CaptionPanel } from "@/components/CaptionPanel";
 import { VyroWorkspace } from "@/components/VyroWorkspace";
 import { WhisperSettingsPanel } from "@/components/WhisperSettingsPanel";
@@ -56,6 +56,7 @@ import {
 import {
   drawFrame,
   exportClip,
+  exportClipsBatch,
   gpuInfo,
   shortGpuName,
   numberCues,
@@ -92,7 +93,6 @@ const DEFAULTS: ClipSettings = {
   animations: true,
   effects: true,
   wordsPerPage: 3,
-  fps: "29.97",
   voiceEnhance: true,
   manualX: null,
   manualY: null,
@@ -127,6 +127,38 @@ function sourceIdFor(file: File) {
   return id;
 }
 
+/**
+ * Widen a clip window by its start/end padding (seconds), clamped to the media, and re-slice the
+ * transcript words so the padded frames carry the right captions. Preview stays on the unpadded
+ * cut; only the exported job is extended.
+ */
+function paddedJob(
+  job: ClipJob,
+  words: Word[],
+  duration: number,
+): { start: number; end: number; words: Word[] } {
+  const padStart = job.settings.startPad ?? 0;
+  const padEnd = job.settings.endPad ?? 0;
+  if (!padStart && !padEnd) return { start: job.start, end: job.end, words: job.words };
+  const start = Math.max(0, job.start - padStart);
+  const end = duration > 0 ? Math.min(duration, job.end + padEnd) : job.end + padEnd;
+  return { start, end, words: words.filter((w) => w.e > start && w.s < end) };
+}
+/** Ask the worker for the source cadence it will render at. Silent until the source is cached. */
+async function probeSourceFps(file: File): Promise<number | null> {
+  try {
+    const sid = await sourceIdFor(file);
+    const res = await fetch(`${HELPER}/v1/sources/${encodeURIComponent(sid)}/render-info`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) return null;
+    const info = (await res.json()) as { fps?: unknown };
+    return typeof info.fps === "number" && Number.isFinite(info.fps) ? info.fps : null;
+  } catch {
+    return null;
+  }
+}
+
 async function trackWithWorkerFallback(
   src: string,
   file: File | null,
@@ -135,7 +167,7 @@ async function trackWithWorkerFallback(
   layout: ClipSettings["layout"],
   onProgress?: (p: number) => void,
   signal?: AbortSignal,
-): Promise<{ track: TrackPoint[]; speakers?: SpeakerReport } | undefined> {
+): Promise<{ track: TrackPoint[]; speakers?: SpeakerReport; fps?: number } | undefined> {
   const framingMode = layout;
   try {
     const source = file ?? filesByUrl.get(src) ?? null;
@@ -160,6 +192,7 @@ export default function Studio() {
   const [file, setFile] = useState<File | null>(null);
   const [url, setUrl] = useState("");
   const [duration, setDuration] = useState(0);
+  const [sourceFps, setSourceFps] = useState<number | null>(null);
   const [timeframe, setTimeframe] = useState<[number, number]>([0, 0]);
   const [stage, setStage] = useState<Stage>("idle");
   const [progress, setProgress] = useState(0);
@@ -180,6 +213,8 @@ export default function Studio() {
   const [len, setLen] = useState<[number, number]>([20, 60]);
   const [count, setCount] = useState(6);
   const transcribeAbortRef = useRef<AbortController | null>(null);
+  const [batchExport, setBatchExport] = useState<{ total: number; label: string; progress: number } | null>(null);
+  const batchAbortRef = useRef<AbortController | null>(null);
 
   const initVision = useCallback(() => {
     setFaceDelegate("loading");
@@ -219,6 +254,105 @@ export default function Studio() {
   const patchDefaultSettings = (patch: Partial<ClipSettings>) =>
     setDefaultClipSettings((prev) => ({ ...prev, ...patch }));
 
+  /**
+   * Render every discovered clip in one batch: auto-track any clip that still needs it, submit all
+   * decisions to the worker in a single request, then store + download each finished MP4 in order.
+   */
+  async function runBatchExport() {
+    const targets = clips;
+    if (!targets.length || batchExport) return;
+    batchAbortRef.current = new AbortController();
+    const signal = batchAbortRef.current.signal;
+    setBatchExport({ total: targets.length, label: "Preparing batch export…", progress: 0 });
+    try {
+      const sourceFile = file ?? filesByUrl.get(url) ?? null;
+      const renderSourceId = sourceFile ? await sourceIdFor(sourceFile) : undefined;
+      const jobs: ClipJob[] = [];
+      for (let i = 0; i < targets.length; i++) {
+        const c = targets[i]!;
+        const pinned = typeof c.settings.manualX === "number" || typeof c.settings.manualY === "number";
+        let track = c.track;
+        if (!track && !pinned) {
+          setBatchExport({
+            total: targets.length,
+            label: `Auto-tracking clip ${i + 1}/${targets.length}…`,
+            progress: 0.15 * (i / targets.length),
+          });
+          const autoTrack = await trackWithWorkerFallback(url, sourceFile, c.start, c.end, "auto", undefined, signal);
+          if (autoTrack) {
+            track = autoTrack.track;
+            update(c.id, { track: autoTrack.track, speakers: autoTrack.speakers });
+            if (autoTrack.fps) setSourceFps(autoTrack.fps);
+          }
+        }
+        const clipWords = words.filter((w) => w.e > c.start && w.s < c.end);
+        const base: ClipJob = {
+          start: c.start,
+          end: c.end,
+          hook: c.hook,
+          words: clipWords,
+          track,
+          cues: numberCues(clipWords, c.editingCues),
+          settings: c.settings,
+        };
+        const padded = paddedJob(base, words, duration);
+        jobs.push({
+          ...base,
+          start: padded.start,
+          end: padded.end,
+          words: padded.words,
+          cues: numberCues(padded.words, c.editingCues),
+        });
+      }
+      const results = await exportClipsBatch(
+        url,
+        jobs,
+        (p, label) =>
+          setBatchExport({
+            total: targets.length,
+            label: label ?? "Rendering batch on the local FFmpeg renderer…",
+            progress: 0.15 + 0.85 * p,
+          }),
+        signal,
+        { sourceId: renderSourceId, file: sourceFile },
+      );
+      for (let i = 0; i < results.length; i++) {
+        const res = results[i]!;
+        const c = targets[i]!;
+        const u = URL.createObjectURL(res.blob);
+        if (c.exportUrl?.startsWith("blob:")) URL.revokeObjectURL(c.exportUrl);
+        update(c.id, {
+          exportUrl: u,
+          exportMeta: {
+            mode: res.mode,
+            encoder: res.encoder,
+            verified: res.verified,
+            sha256: res.sha256,
+            deliveredFps: res.deliveredFps,
+          },
+        });
+        if (Number.isFinite(res.deliveredFps) && res.deliveredFps > 0) setSourceFps(res.deliveredFps);
+        setBatchExport({ total: targets.length, label: `Saving clip ${i + 1}/${results.length}…`, progress: 1 });
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = `${(c.title || `clip_${i + 1}`).replace(/[^\w]+/g, "_").slice(0, 40)}.mp4`;
+        a.click();
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      toast.success(`Exported ${results.length} clips natively`);
+    } catch (e) {
+      if ((e as Error).message !== "cancelled") {
+        console.error(e);
+        toast.error((e as Error).message || "Batch export failed");
+      }
+    }
+    setBatchExport(null);
+  }
+
+  function cancelBatchExport() {
+    batchAbortRef.current?.abort();
+  }
+
   async function onFile(f: File) {
     if (url) URL.revokeObjectURL(url);
     const u = URL.createObjectURL(f);
@@ -229,6 +363,7 @@ export default function Studio() {
     setWords([]);
     setActiveId(null);
     setStage("idle");
+    setSourceFps(null);
     setStudioView("setup");
     setNavTab("studio");
     const v = document.createElement("video");
@@ -237,6 +372,7 @@ export default function Studio() {
       setDuration(v.duration);
       setTimeframe([0, v.duration]);
     };
+    void probeSourceFps(f).then((fps) => fps && setSourceFps(fps));
   }
 
   async function runLocalTranscription(forceRetranscribe = false): Promise<Word[]> {
@@ -404,6 +540,7 @@ export default function Studio() {
         );
         item.track = tracked?.track;
         item.speakers = tracked?.speakers;
+        if (tracked?.fps) setSourceFps(tracked.fps);
         setProgress((i + 1) / mapped.length);
         setClips([...mapped]);
       }
@@ -754,18 +891,10 @@ export default function Studio() {
                   </div>
                 </Field>
                 <div className="grid grid-cols-2 gap-3">
-                  <Field label="TARGET FRAME RATE">
-                    <select
-                      value={defaultClipSettings.fps ?? "29.97"}
-                      aria-label="Target frame rate"
-                      onChange={(e) =>
-                        patchDefaultSettings({ fps: e.target.value as "29.97" | "30" })
-                      }
-                      className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-base sm:text-xs"
-                    >
-                      <option value="29.97">29.97 fps</option>
-                      <option value="30">30.00 fps</option>
-                    </select>
+                  <Field label="SOURCE FRAME RATE">
+                    <div className="rounded-md border border-border bg-surface px-3 py-2 font-mono text-base text-primary sm:text-xs">
+                      {sourceFps ? `${sourceFps.toFixed(3).replace(/\.?0+$/, "")} fps · matched` : "Auto-match source"}
+                    </div>
                   </Field>
                   <Field label="CAPTION TIMING SOURCE">
                     <div className="rounded-md border border-border bg-surface px-3 py-2 font-mono text-xs text-primary">
@@ -904,11 +1033,33 @@ export default function Studio() {
                 <h3 className="font-display font-bold">
                   Clips <span className="text-muted-foreground">({clips.length})</span>
                 </h3>
-                <Button variant="ghost" size="sm" onClick={addManual}>
-                  <Plus className="size-4" />
-                  Add
-                </Button>
+                <div className="flex items-center gap-1">
+                  <Button variant="ghost" size="sm" onClick={addManual}>
+                    <Plus className="size-4" />
+                    Add
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={runBatchExport}
+                    disabled={batchExport !== null || clips.length === 0}
+                  >
+                    <Download className="size-4" />
+                    Export all
+                  </Button>
+                </div>
               </div>
+              {batchExport && (
+                <div className="space-y-1 rounded-lg border border-border bg-accent p-2">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="truncate text-muted-foreground">{batchExport.label}</span>
+                    <button onClick={cancelBatchExport} className="shrink-0 font-mono text-[11px] text-hot hover:underline">
+                      cancel
+                    </button>
+                  </div>
+                  <Progress value={Math.round(batchExport.progress * 100)} />
+                </div>
+              )}
+
               {clips.map((c) => (
                 <button
                   key={c.id}
@@ -935,11 +1086,7 @@ export default function Studio() {
                   <p className="mt-1.5 line-clamp-2 text-xs text-muted-foreground">{c.reason}</p>
                   {c.exportMeta && (
                     <span className="mt-2 inline-block rounded bg-primary px-1.5 py-0.5 font-mono text-[10px] text-primary-foreground">
-                      {c.exportMeta.mode === "nvenc"
-                        ? "NVENC MASTERED"
-                        : c.exportMeta.mode === "ffmpeg_cpu"
-                          ? "FFMPEG MASTERED"
-                          : "BROWSER EXPORT"}
+                      {c.exportMeta.mode === "nvenc" ? "NVENC MASTERED" : "FFMPEG MASTERED"}
                     </span>
                   )}
                 </button>
@@ -963,6 +1110,7 @@ export default function Studio() {
                 file={file}
                 words={words}
                 duration={duration}
+                sourceFps={sourceFps}
                 onChange={(p) => update(active.id, p)}
                 onWords={(updated) =>
                   setWords((current) =>
@@ -972,6 +1120,7 @@ export default function Studio() {
                     ].sort((a, b) => a.s - b.s),
                   )
                 }
+                onSourceFps={setSourceFps}
               />
             ) : (
               <div className="grid h-full min-h-[500px] place-items-center rounded-lg border border-dashed border-border grid-lines text-center">
@@ -1124,16 +1273,20 @@ function Editor({
   file,
   words,
   duration,
+  sourceFps,
   onChange,
   onWords,
+  onSourceFps,
 }: {
   clip: Clip;
   src: string;
   file: File | null;
   words: Word[];
   duration: number;
+  sourceFps: number | null;
   onChange: (p: Partial<Clip>) => void;
   onWords: (words: Word[]) => void;
+  onSourceFps: (fps: number) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1241,6 +1394,7 @@ function Editor({
         setTracking,
       );
       if (!tracked) throw new Error("tracking unavailable");
+      if (tracked.fps) onSourceFps(tracked.fps);
       onChange({
         track: tracked.track,
         speakers: tracked.speakers,
@@ -1279,9 +1433,21 @@ function Editor({
           abortRef.current.signal,
         );
         if (autoTrack) {
+          if (autoTrack.fps) onSourceFps(autoTrack.fps);
           onChange({ track: autoTrack.track, speakers: autoTrack.speakers });
           activeJob = { ...activeJob, track: autoTrack.track };
         }
+      }
+      // Cut padding extends the exported window (and re-slices captions) without moving the preview.
+      const padded = paddedJob(activeJob, words, duration);
+      if (padded.start !== activeJob.start || padded.end !== activeJob.end) {
+        activeJob = {
+          ...activeJob,
+          start: padded.start,
+          end: padded.end,
+          words: padded.words,
+          cues: numberCues(padded.words, clip.editingCues),
+        };
       }
       // The renderer addresses the source by the id its cached copy is stored under, so an export
       // never has to re-upload 300 MB just to cut a clip.
@@ -1298,6 +1464,7 @@ function Editor({
         { sourceId: renderSourceId, file: sourceFile },
       );
       const u = URL.createObjectURL(res.blob);
+      if (Number.isFinite(res.deliveredFps) && res.deliveredFps > 0) onSourceFps(res.deliveredFps);
       // Every export holds a 100 MB-class blob behind an object URL. Releasing the previous one is
       // what keeps the renderer's blob storage free enough to accept the next master.
       if (clip.exportUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.exportUrl);
@@ -1316,12 +1483,9 @@ function Editor({
       a.download = `${clip.title.replace(/[^\w]+/g, "_").slice(0, 40)}.${res.blob.type.includes("mp4") ? "mp4" : "webm"}`;
       a.click();
       const rate = `${res.deliveredFps.toFixed(1)} fps delivered`;
-      const modeText =
-        res.mode === "nvenc"
-          ? `Mastered via NVIDIA NVENC (${rate})`
-          : res.mode === "ffmpeg_cpu"
-            ? `Mastered via local FFmpeg (${rate})`
-            : `Exported via browser stream (${rate})`;
+      const modeText = `${
+        res.mode === "nvenc" ? "Mastered via NVIDIA NVENC" : "Mastered via local FFmpeg"
+      } (${rate})`;
       toast.success(modeText);
     } catch (e) {
       if ((e as Error).message !== "cancelled") {
@@ -1475,13 +1639,11 @@ function Editor({
               <CheckCircle2 className="size-3.5" />
               {clip.exportMeta.mode === "nvenc"
                 ? "Local NVIDIA NVENC Master"
-                : clip.exportMeta.mode === "ffmpeg_cpu"
-                  ? "Local FFmpeg CPU Master"
-                  : "Browser Stream Export"}
+                : "Local FFmpeg CPU Master"}
             </p>
             <p className="mt-0.5 text-muted-foreground">
               Encoder: {clip.exportMeta.encoder} · {clip.exportMeta.deliveredFps.toFixed(1)} fps ·{" "}
-              {clip.exportMeta.verified ? "ffprobe verified" : "Browser stream"}
+              {clip.exportMeta.verified ? "ffprobe verified" : "not ffprobe-verified"}
             </p>
             {clip.exportUrl && (
               <a
@@ -1690,16 +1852,10 @@ function Editor({
             </div>
           </Field>
           <div className="grid grid-cols-2 gap-2">
-            <Field label="TARGET FRAME RATE">
-              <select
-                value={s.fps ?? "29.97"}
-                aria-label="Target frame rate"
-                onChange={(e) => setS({ fps: e.target.value as "29.97" | "30" })}
-                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-base sm:text-xs"
-              >
-                <option value="29.97">29.97 fps</option>
-                <option value="30">30.00 fps</option>
-              </select>
+            <Field label="SOURCE FRAME RATE">
+              <div className="rounded-md border border-border bg-surface px-2.5 py-1.5 font-mono text-base text-primary sm:text-xs">
+                {sourceFps ? `${sourceFps.toFixed(3).replace(/\.?0+$/, "")} fps · matched` : "Auto-match source"}
+              </div>
             </Field>
             <Field label="CAPTION TIMING SOURCE">
               <div className="rounded-md border border-border bg-surface px-2.5 py-1.5 font-mono text-[11px] text-primary">
@@ -1775,6 +1931,32 @@ function Editor({
             on={(v) => setS({ showEmojis: v })}
           />
           <Toggle label="Progress bar" v={s.progressBar} on={(v) => setS({ progressBar: v })} />
+          <Field label="Cut padding (seconds before / after the clip)">
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={3}
+                step={0.1}
+                aria-label="Start padding seconds"
+                value={s.startPad ?? 0}
+                onChange={(e) => setS({ startPad: Math.min(3, Math.max(0, Number(e.target.value) || 0)) })}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+              <span className="text-muted-foreground">/</span>
+              <input
+                type="number"
+                min={0}
+                max={3}
+                step={0.1}
+                aria-label="End padding seconds"
+                value={s.endPad ?? 0}
+                onChange={(e) => setS({ endPad: Math.min(3, Math.max(0, Number(e.target.value) || 0)) })}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
+          </Field>
+
           <Field label="Lower-third name">
             <input
               value={s.brandLabel ?? ""}

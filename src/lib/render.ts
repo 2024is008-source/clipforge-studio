@@ -5,6 +5,7 @@
 // - Auto polish: contrast/saturation grade, big number callouts from editing cues, lower third, audio fades
 import type { Word } from "./media";
 import { layoutTransitionSec, punchGainOf } from "./edit-tuning";
+import { DEFAULT_MOTION, motionSpec } from "./motion";
 import { sampleTrack, type TrackPoint } from "./reframe";
 import {
   captionPages,
@@ -24,13 +25,12 @@ import {
   type CaptionStyle,
   type WordMotion,
 } from "./subtitles";
-import { browserCaptureForced, renderWithLocalBackend } from "./backend-render";
+import { renderBatchWithLocalBackend, renderWithLocalBackend } from "./backend-render";
 import { HELPER } from "@/components/YouTubeImport";
 
 export type { CaptionStyle } from "./subtitles";
 export type Layout = "auto" | "fill" | "split" | "grid3" | "editorial" | "fit";
-export type TargetFps = "29.97" | "30";
-export type ExportMode = "nvenc" | "ffmpeg_cpu" | "browser_fallback";
+export type ExportMode = "nvenc" | "ffmpeg_cpu";
 
 export type ExportResult = {
   blob: Blob;
@@ -59,11 +59,23 @@ export type ClipSettings = {
   animationStrength?: number;
   animations?: boolean;
   effects?: boolean;
-  fps?: TargetFps;
   voiceEnhance?: boolean;
   brandLabel?: string;
   manualX?: number | null;
   manualY?: number | null;
+  /** Pop/easing character for hooks, callouts, emojis and caption words. */
+  motion?: import("./motion").MotionPreset;
+  /** Custom cubic-bezier [x1,y1,x2,y2] used when motion === "custom". */
+  customCurve?: import("./motion").Bezier;
+  /** Force uppercase for every caption style, not just the punchy presets. */
+  captionUppercase?: boolean;
+  /** Extra word outline thickness in px; undefined keeps the per-style default. */
+  captionOutline?: number;
+  /** Draw a translucent box behind each caption line. */
+  captionBox?: boolean;
+  /** Extend the exported clip window before the cut / after the cut, in seconds. */
+  startPad?: number;
+  endPad?: number;
 };
 
 export type ClipJob = {
@@ -154,9 +166,9 @@ function mixHex(a: string, b: string, x: number): string {
 }
 
 /** Overshoot-then-settle pop used by hook cards, number callouts and emojis. */
-function popScale(age: number, attack = 0.16, settle = 0.14, peak = 1.1): number {
-  if (age < attack) return 0.55 + (peak - 0.55) * smoothstep(age / attack);
-  if (age < attack + settle) return peak - (peak - 1) * smoothstep((age - attack) / settle);
+function popScale(age: number, m = DEFAULT_MOTION, peak = m.peak): number {
+  if (age < m.attack) return 0.55 + (peak - 0.55) * m.ease(age / m.attack);
+  if (age < m.attack + m.settle) return peak - (peak - 1) * m.ease((age - m.attack) / m.settle);
   return 1;
 }
 
@@ -296,6 +308,7 @@ function drawEmphasisCallouts(
   s: ClipSettings,
 ) {
   if (!cues?.length) return;
+  const motion = motionSpec(s.motion, s.customCurve);
   for (const c of cues) {
     const text = c.quote.trim().toUpperCase();
     if (!/\d/.test(text)) continue;
@@ -304,7 +317,7 @@ function drawEmphasisCallouts(
     if (t < enter || t > exit) continue;
     const age = t - enter;
     const animate = s.animations !== false;
-    const scale = animate ? popScale(age) : 1;
+    const scale = animate ? popScale(age, motion) : 1;
     let size = text.length > 9 ? 104 : 138;
     let face = `900 ${size}px Montserrat, sans-serif`;
     ctx.font = face;
@@ -719,8 +732,12 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
 
+  const mspec = motionSpec(s.motion, s.customCurve);
+  const forceUpper = s.captionUppercase === true;
   const txt = (w: Word) =>
-    ["opus", "beast", "bounce", "glow"].includes(s.captionStyle) ? w.w.toUpperCase() : w.w;
+    forceUpper || ["opus", "beast", "bounce", "glow"].includes(s.captionStyle)
+      ? w.w.toUpperCase()
+      : w.w;
   const maxLineWidth = W - 160;
   const widest = Math.max(1, ...pg.map((w) => ctx.measureText(txt(w)).width));
   if (widest > maxLineWidth) {
@@ -753,7 +770,7 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
       // popScale already carries hook cards and number callouts; the emoji used to run its own
       // quarter-sine attack followed by a linear decay, so it settled differently from everything
       // else on screen.
-      const pop = s.animations === false ? 1 : popScale(elapsed, 0.18, 0.16, 1.15);
+      const pop = s.animations === false ? 1 : popScale(elapsed, mspec, 1.15);
       const emojiY = baseY - lh * 0.95;
       const emojiFont = `${Math.round(size * 1.55)}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
       const sprite = styledTextSprite(ctx, {
@@ -791,11 +808,19 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
     let x = (W - total) / 2;
     const y = baseY + li * lh;
 
+    if (s.captionBox && line.length) {
+      ctx.save();
+      ctx.fillStyle = "rgba(8,8,10,0.62)";
+      roundRect(ctx, x - 24, y - size * 0.68, total + 48, size * 1.36, 14);
+      ctx.fill();
+      ctx.restore();
+    }
+
     line.forEach((w, i) => {
       const motion: WordMotion =
         s.animations === false
           ? staticMotion(s.captionStyle, t, w)
-          : wordMotion(s.captionStyle, t, w, s.animationStrength ?? 1);
+          : wordMotion(s.captionStyle, t, w, s.animationStrength ?? 1, mspec.ease);
       const active = motion.active;
       const past = t > w.e;
       const ww = widths[i] ?? 0;
@@ -871,17 +896,18 @@ export function drawCaption(ctx: CanvasRenderingContext2D, pg: Word[], t: number
       }
 
       const skipStroke = s.captionStyle === "karaoke" && motion.activity >= 0.5;
+      const baseStroke = isOpus
+        ? Math.max(14, Math.round(size * 0.22))
+        : 14;
+      const outline = s.captionOutline;
+      const strokeWidth =
+        s.captionStyle === "minimal" || skipStroke ? 0 : Math.max(0, outline ?? baseStroke);
       const sprite = styledTextSprite(ctx, {
         text: visible,
         font: font(),
         fill,
-        stroke: s.captionStyle === "minimal" || skipStroke ? undefined : "#000000",
-        strokeWidth:
-          s.captionStyle === "minimal" || skipStroke
-            ? 0
-            : isOpus
-              ? Math.max(14, Math.round(size * 0.22))
-              : 14,
+        stroke: strokeWidth > 0 ? "#000000" : undefined,
+        strokeWidth,
         ...shadow,
       });
 
@@ -1047,19 +1073,6 @@ function blitStyledText(
   ctx.drawImage(sprite, cx - sprite.width / 2, cy - sprite.height / 2);
 }
 
-export function pickMime() {
-  const opts = [
-    "video/mp4;codecs=avc1.64002A,mp4a.40.2",
-    "video/mp4;codecs=avc1.640028,mp4a.40.2",
-    "video/mp4;codecs=avc1.4D4028,mp4a.40.2",
-    "video/mp4",
-    "video/webm;codecs=h264,opus",
-    "video/webm;codecs=vp9,opus",
-    "video/webm",
-  ];
-  return opts.find((m) => MediaRecorder.isTypeSupported(m)) ?? "video/webm";
-}
-
 async function computeSha256Hex(blob: Blob): Promise<string> {
   try {
     const buf = await blob.arrayBuffer();
@@ -1072,105 +1085,6 @@ async function computeSha256Hex(blob: Blob): Promise<string> {
   }
 }
 
-const NAMED_RATES: [string, number][] = [
-  ["23.976", 24000 / 1001],
-  ["24", 24],
-  ["25", 25],
-  ["29.97", 30000 / 1001],
-  ["30", 30],
-  ["59.94", 60000 / 1001],
-  ["60", 60],
-];
-
-/**
- * The rate the master should write: what the capture actually delivered, snapped to the nearest named
- * rate. Never the requested rate when delivery fell short — padding a short pass up to 29.97 is what
- * turns skipped frames into a stutter, and it lets the file claim a frame rate it does not have.
- */
-function masterRateText(_measured: number, requested: number): string {
-  // Always master at the requested broadcast constant frame rate (29.97 or 30 fps) — never write
-  // a throttled 8.8 fps / 9.1 fps rational into the final H.264 MP4 container.
-  for (const [label, value] of NAMED_RATES) if (Math.abs(requested - value) < 0.05) return label;
-  return requested >= 29.98 ? "30" : "29.97";
-}
-
-/**
- * Draw and capture one canvas frame per video frame the decoder presents. Reports the frame rate that
- * actually came out of the capture (frames drawn / span of their presentation timestamps) and how much
- * of the requested window the pass really covered — a backgrounded tab stops presenting frames, and a
- * truncated pass must never be mistaken for a finished clip.
- */
-async function capturePresentedFrames(
-  v: HTMLVideoElement,
-  ctx: CanvasRenderingContext2D,
-  job: ClipJob,
-  canvasTrack: (MediaStreamTrack & { requestFrame?: () => void }) | undefined,
-  dur: number,
-  signal: AbortSignal | undefined,
-  onProgress: (p: number, stageLabel?: string) => void,
-  fallbackFps: number,
-): Promise<{ fps: number; covered: number }> {
-  const requestNext = (
-    v as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number }
-  ).requestVideoFrameCallback;
-  const stamps: number[] = [];
-  const startedAt = performance.now();
-  const minFrameIntervalMs = Math.max(12, (1000 / fallbackFps) * 0.72);
-  let lastDrawPerf = 0;
-
-  return new Promise<{ fps: number; covered: number }>((resolve) => {
-    let pace: ReturnType<typeof setInterval> | null = null;
-    let watchdog: ReturnType<typeof setInterval> | null = null;
-    let finished = false;
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      if (pace !== null) clearInterval(pace);
-      if (watchdog !== null) clearInterval(watchdog);
-      const covered = Math.max(0, Math.min(1, (v.currentTime - job.start) / Math.max(0.1, dur)));
-      const trimmed = stamps.length > 30 ? stamps.slice(2) : stamps;
-      const span = trimmed.length > 1 ? (trimmed[trimmed.length - 1]! - trimmed[0]!) / 1000 : 0;
-      if (trimmed.length < 12 || span <= 0.25) {
-        resolve({ fps: covered >= 0.9 ? fallbackFps : 0, covered });
-        return;
-      }
-      resolve({ fps: Math.min(fallbackFps, (trimmed.length - 1) / span), covered });
-    };
-    const renderOneFrame = () => {
-      if (finished) return;
-      if (signal?.aborted || v.currentTime >= job.end || v.ended) {
-        finish();
-        return;
-      }
-      const now = performance.now();
-      if (now - lastDrawPerf < minFrameIntervalMs) return;
-      lastDrawPerf = now;
-      stamps.push(now);
-      drawFrame(ctx, v, v.currentTime, job);
-      canvasTrack?.requestFrame?.();
-      onProgress(
-        Math.min(0.88, (v.currentTime - job.start) / Math.max(0.1, dur)),
-        "Capturing smooth 29.97fps composition…",
-      );
-    };
-    const onVideoFrame = () => {
-      if (finished) return;
-      renderOneFrame();
-      if (requestNext) requestNext.call(v, onVideoFrame);
-    };
-
-    // Always run a steady CFR cadence timer alongside requestVideoFrameCallback so animated captions
-    // and video frames never drop to 8.8 fps or freeze on Frame 0 if the browser throttles callbacks.
-    if (requestNext) requestNext.call(v, onVideoFrame);
-    pace = setInterval(renderOneFrame, Math.round(1000 / fallbackFps));
-    watchdog = setInterval(() => {
-      const lastActivity = stamps.length ? stamps[stamps.length - 1]! : startedAt;
-      if (performance.now() - lastActivity <= (stamps.length ? 3000 : 9000)) return;
-      finish();
-    }, 500);
-  });
-}
-
 export async function exportClip(
   src: string,
   job: ClipJob,
@@ -1179,260 +1093,57 @@ export async function exportClip(
   backend?: { sourceId?: string | undefined; file?: File | Blob | null | undefined },
 ): Promise<ExportResult> {
   if (signal?.aborted) throw new Error("cancelled");
-  // Native export is mandatory except for the explicit development A/B switch. Never silently
-  // replace a failed renderer or missing overlay API with a real-time browser recording.
-  if (!browserCaptureForced()) {
-    const out = await renderWithLocalBackend(job, backend?.sourceId, onProgress, signal, {
-      file: backend?.file,
-      src,
-    });
+  // Final exports are always mastered by the local worker's native FFmpeg/NVENC pipeline. There is no
+  // browser MediaRecorder path: an offline or failed renderer surfaces as an error instead of silently
+  // falling back to a real-time canvas recording that bypasses the backend.
+  const out = await renderWithLocalBackend(job, backend?.sourceId, onProgress, signal, {
+    file: backend?.file,
+    src,
+  });
+  const sha256 = await computeSha256Hex(out.blob);
+  if (signal?.aborted) throw new Error("cancelled");
+  return {
+    blob: out.blob,
+    mode: out.encoder === "h264_nvenc" ? "nvenc" : "ffmpeg_cpu",
+    encoder: out.encoder,
+    verified: out.verified,
+    sha256,
+    deliveredFps: out.deliveredFps,
+  };
+}
+
+/**
+ * Export several accepted clips in one batch against the same source. The video is cached once and
+ * FFmpeg passes are streamed by the worker, so this is materially faster than looping exportClip.
+ * Results come back in the same order as `jobs`.
+ */
+export async function exportClipsBatch(
+  src: string,
+  jobs: ClipJob[],
+  onProgress: (p: number, stageLabel?: string) => void,
+  signal?: AbortSignal,
+  backend?: { sourceId?: string | undefined; file?: File | Blob | null | undefined },
+): Promise<ExportResult[]> {
+  if (signal?.aborted) throw new Error("cancelled");
+  if (!jobs.length) return [];
+  const outs = await renderBatchWithLocalBackend(jobs, backend?.sourceId, onProgress, signal, {
+    file: backend?.file,
+    src,
+  });
+  const results: ExportResult[] = [];
+  for (const out of outs) {
     const sha256 = await computeSha256Hex(out.blob);
     if (signal?.aborted) throw new Error("cancelled");
-    return {
+    results.push({
       blob: out.blob,
       mode: out.encoder === "h264_nvenc" ? "nvenc" : "ffmpeg_cpu",
       encoder: out.encoder,
       verified: out.verified,
       sha256,
       deliveredFps: out.deliveredFps,
-    };
-  }
-
-  const canvas = document.createElement("canvas");
-  canvas.width = W;
-  canvas.height = H;
-  // `desynchronized` trades a copy per frame for direct scanout, and a copy is exactly what the
-  // capture path needs to hand the frame to the encoder. Without it the pass keeps up with playback.
-  const firstContext = canvas.getContext("2d", { alpha: false });
-  if (!firstContext) throw new Error("Your browser cannot create a video canvas.");
-  const ctx: CanvasRenderingContext2D = firstContext;
-  await document.fonts.ready;
-
-  const dur = Math.max(0.4, job.end - job.start);
-  // Measured from the frames the decoder actually presented; the master encodes at this rate so it
-  // never has to duplicate a frame to reach a rate the capture did not deliver.
-  const requestedFps = job.settings.fps === "30" ? 30 : 30000 / 1001;
-  const mime = pickMime();
-
-  /**
-   * One real-time pass of the whole composition into a recorded blob, with the frame rate that
-   * actually came out. A pass needs its own video element and AudioContext — a media element can only
-   * ever be routed into one graph — so each attempt builds both from scratch.
-   */
-  async function capturePass(): Promise<{ parts: Blob[]; fps: number; covered: number }> {
-    const v = document.createElement("video");
-    v.src = src;
-    v.playsInline = true;
-    v.crossOrigin = "anonymous";
-    v.preload = "auto";
-    // CRITICAL CHROMIUM FIX: Mount `<video>` in a 1x1px viewport-resident container during export!
-    // An unmounted off-DOM `<video>` has its hardware frame decoding suspended after Frame 0 while
-    // WebAudio keeps playing — which caused the 8.8fps Frame-0 freeze on podcast exports.
-    v.style.cssText =
-      "position:fixed;bottom:0;right:0;width:2px;height:2px;opacity:0.001;pointer-events:none;z-index:-1;";
-    if (typeof document !== "undefined" && document.body) {
-      document.body.appendChild(v);
-    }
-    await new Promise((r, rej) => {
-      v.onloadeddata = r;
-      v.onerror = () => rej(new Error("Failed to load source video for export."));
     });
-
-    const ac = new AudioContext({ sampleRate: 48000 });
-    const node = ac.createMediaElementSource(v);
-    const dest = ac.createMediaStreamDestination();
-
-    const limiter = ac.createDynamicsCompressor();
-    limiter.threshold.value = -1.0;
-    limiter.knee.value = 0.0;
-    limiter.ratio.value = 20.0;
-    limiter.attack.value = 0.001;
-    limiter.release.value = 0.05;
-
-    if (job.settings.voiceEnhance ?? true) {
-      const hp = ac.createBiquadFilter();
-      hp.type = "highpass";
-      hp.frequency.value = 75;
-      const comp = ac.createDynamicsCompressor();
-      comp.threshold.value = -18;
-      comp.knee.value = 10;
-      comp.ratio.value = 2.8;
-      comp.attack.value = 0.005;
-      comp.release.value = 0.18;
-      const gain = ac.createGain();
-      gain.gain.value = 1.15;
-      node.connect(hp).connect(comp).connect(gain).connect(limiter);
-    } else {
-      node.connect(limiter);
-    }
-
-    // Edit-style fade in/out so clips don't start or end on a hard audio cut.
-    const fader = ac.createGain();
-    limiter.connect(fader).connect(dest);
-
-    if (Math.abs(v.currentTime - job.start) > 0.001) {
-      await new Promise<void>((res) => {
-        v.onseeked = () => res();
-        v.currentTime = job.start;
-      });
-    }
-    drawFrame(ctx, v, job.start, job);
-
-    // captureStream(0) plus requestFrame() puts exactly one canvas frame on the wire per frame the
-    // decoder presents. A fixed-rate capture plus a wall-clock interval instead samples the canvas on
-    // its own clock, so a hiccup duplicates one video frame and skips the next — the judder that reads
-    // as lag once the master re-timed everything to a constant rate.
-    const stream = canvas.captureStream(requestedFps);
-    const canvasTrack = stream.getVideoTracks()[0] as
-      (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
-    dest.stream.getAudioTracks().forEach((tr) => stream.addTrack(tr));
-
-    const rec = new MediaRecorder(stream, {
-      mimeType: mime,
-      videoBitsPerSecond: 16_000_000,
-      audioBitsPerSecond: 288_000,
-    });
-    const parts: Blob[] = [];
-    rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
-    const done = new Promise<void>((r) => {
-      rec.onstop = () => r();
-    });
-
-    let capture = { fps: 0, covered: 0 };
-    try {
-      rec.start(200);
-      await v.play();
-      const a0 = ac.currentTime;
-      fader.gain.setValueAtTime(0.0001, a0);
-      fader.gain.linearRampToValueAtTime(1, a0 + Math.min(0.12, dur * 0.25));
-      fader.gain.setValueAtTime(1, a0 + Math.max(0.15, dur - 0.3));
-      fader.gain.linearRampToValueAtTime(0.0001, a0 + dur);
-      capture = await capturePresentedFrames(
-        v,
-        ctx,
-        job,
-        canvasTrack,
-        dur,
-        signal,
-        onProgress,
-        requestedFps,
-      );
-    } finally {
-      v.pause();
-      if (rec.state !== "inactive") rec.stop();
-      await done;
-      stream.getTracks().forEach((tr) => tr.stop());
-      await ac.close().catch(() => {});
-      // Clearing `src` alone leaves the hardware decoder attached until the element is collected, and
-      // a fourth element in the same page stops presenting frames at all. load() after removing the
-      // attribute tears the media pipeline down now, so the next pass gets a decoder.
-      v.removeAttribute("src");
-      v.load();
-      v.remove();
-    }
-    return { parts, fps: capture.fps, covered: capture.covered };
   }
-
-  let pass = await capturePass();
-  // The first pass pays for every styled word once, and a media element only starts presenting at
-  // full rate after it has settled. If that pass fell behind, the retry draws from the warm caches
-  // and is the pass that gets shipped — a repeat of the same content costs far more than it saves.
-  if ((pass.fps < 0.8 * requestedFps || pass.covered < 0.97) && !signal?.aborted) {
-    onProgress(0.03, "Re-capturing with a warmed renderer…");
-    const again = await capturePass();
-    if (again.covered * again.fps > pass.covered * pass.fps) pass = again;
-  }
-  if (signal?.aborted) throw new Error("cancelled");
-  // A pass that never reached the end of the window is a truncated clip, not a shorter export: the
-  // encoder would happily master the fragment and report it as verified.
-  if (pass.covered < 0.97) {
-    throw new Error(
-      `The capture only reached ${Math.round(pass.covered * 100)}% of the clip. Keep this tab in the foreground and export again.`,
-    );
-  }
-  const capturedFps = pass.fps;
-  const rawBlob = new Blob(pass.parts, { type: mime.split(";")[0] ?? "video/mp4" });
-  // Blob construction copies the bytes, so leaving the recorder's chunk array alive holds the whole
-  // capture twice. The master response is another ~100 MB, and the renderer refuses the transfer
-  // long before the disk does.
-  pass.parts.length = 0;
-
-  try {
-    const health = await fetch(`${HELPER}/health`, { signal: AbortSignal.timeout(1000) });
-    if (health.ok) {
-      const hData = (await health.json()) as { encoder?: string | null };
-      const encLabel =
-        hData.encoder === "h264_nvenc"
-          ? "Smoothing & mastering on NVIDIA NVENC…"
-          : "Smoothing & mastering via local FFmpeg…";
-      onProgress(0.92, encLabel);
-      // FormData is single-use once the body is consumed, so every attempt rebuilds it around the
-      // same blob. Returns null when the worker answered with a real rejection — repeating a failed
-      // render only costs another minute — and throws for transport faults, which are worth a retry.
-      const masterOnce = async (): Promise<ExportResult | null> => {
-        const fd = new FormData();
-        fd.append("file", rawBlob, "raw_capture.webm");
-        fd.append("fps", masterRateText(capturedFps, requestedFps));
-        fd.append("voiceEnhance", String(job.settings.voiceEnhance ?? true));
-        const reqInit: RequestInit = { method: "POST", body: fd };
-        if (signal) reqInit.signal = signal;
-        const mastered = await fetch(`${HELPER}/master`, reqInit);
-        if (!mastered.ok) {
-          console.warn(
-            `Local master rejected with HTTP ${mastered.status}; shipping browser stream`,
-          );
-          return null;
-        }
-        // Chrome refuses `response.blob()` once a body is big enough to need blob storage: it throws
-        // TypeError: Failed to fetch within milliseconds, with the bytes already delivered and the
-        // master already written. Taking the buffer and wrapping it costs ~1.6 s per 100 MB and is
-        // the difference between shipping an NVENC master and silently shipping the browser stream.
-        const mp4Blob = new Blob([await mastered.arrayBuffer()], { type: "video/mp4" });
-        const encoderUsed = mastered.headers.get("X-Video-Encoder") || hData.encoder || "libx264";
-        const verified = mastered.headers.get("X-FFprobe-Verified") === "true";
-        const sha256 = await computeSha256Hex(mp4Blob);
-        onProgress(1, "Master complete");
-        return {
-          blob: mp4Blob,
-          mode: encoderUsed === "h264_nvenc" ? "nvenc" : "ffmpeg_cpu",
-          encoder: encoderUsed,
-          verified,
-          sha256,
-          deliveredFps: capturedFps,
-        };
-      };
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          const out = await masterOnce();
-          if (out) return out;
-          break;
-        } catch (e) {
-          if (signal?.aborted || attempt === 2) throw e;
-          console.warn(`Local master attempt ${attempt} broke in transport; retrying once`, e);
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      }
-    } else {
-      console.warn(
-        `Local master skipped: worker health HTTP ${health.status}; shipping browser stream`,
-      );
-    }
-  } catch (e) {
-    if (signal?.aborted || (e as Error).name === "AbortError") throw new Error("cancelled");
-    console.warn("Local master failed; shipping browser stream instead", e);
-  }
-
-  const sha256 = await computeSha256Hex(rawBlob);
-  if (signal?.aborted) throw new Error("cancelled");
-  onProgress(1, "Browser fallback export complete");
-  return {
-    blob: rawBlob,
-    mode: "browser_fallback",
-    encoder: mime,
-    verified: false,
-    sha256,
-    deliveredFps: capturedFps,
-  };
+  return results;
 }
 
 export function shortGpuName(raw: string): string {

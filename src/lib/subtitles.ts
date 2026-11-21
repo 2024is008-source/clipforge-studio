@@ -251,10 +251,11 @@ function smoothstep(x: number): number {
  * for the bounce lift, whose raw `sin(p*PI)` reached the same peak but arrived back at rest with a
  * non-zero velocity and a `Math.sin(Math.PI)` residue that never quite settled to zero.
  */
-function hump(age: number, attack: number, settle: number): number {
+function hump(age: number, attack: number, settle: number, ease: (x: number) => number = smoothstep): number {
   if (age <= 0) return 0;
-  if (age < attack) return smoothstep(age / attack);
-  return 1 - smoothstep((age - attack) / settle);
+  const clamp = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  if (age < attack) return ease(clamp(age / attack));
+  return 1 - ease(clamp((age - attack) / settle));
 }
 
 /**
@@ -283,6 +284,7 @@ export function wordMotion(
   time: number,
   word: Word,
   strength = 1,
+  ease?: (x: number) => number,
 ): WordMotion {
   const elapsed = Math.max(0, time - word.s);
   const active = time >= word.s && time < word.e;
@@ -291,11 +293,11 @@ export function wordMotion(
     y = 0,
     alpha = 1;
   if (style === "bounce" && time >= word.s) {
-    const a = hump(elapsed, BOUNCE.attack, BOUNCE.settle);
+    const a = hump(elapsed, BOUNCE.attack, BOUNCE.settle, ease);
     scale += BOUNCE.peak * a * strength;
     y = -BOUNCE.lift * a * strength;
   } else if (style === "beast" || style === "opus") {
-    scale += POP.peak * hump(elapsed, POP.attack, POP.settle) * strength;
+    scale += POP.peak * hump(elapsed, POP.attack, POP.settle, ease) * strength;
   } else if (style === "reveal") {
     const p = Math.min(1, elapsed / REVEAL.duration);
     alpha = time < word.s ? 0 : 1 - Math.pow(1 - p, 3);

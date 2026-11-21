@@ -13,7 +13,7 @@ const job: ClipJob = {
   words: [{ w: "shared", s: 12.5, e: 13 }],
   settings: {
     layout: "fit", captionStyle: "opus", highlight: "#22ff4e", captionY: 0.78,
-    showHook: true, progressBar: true, zoomPunch: false, wordsPerPage: 3, fps: "30",
+    showHook: true, progressBar: true, zoomPunch: false, wordsPerPage: 3,
   },
 };
 const base = "http://localhost:8765/v1/render/overlays";
