@@ -108,6 +108,23 @@ def detect_video_encoder() -> str | None:
 VIDEO_ENCODER_CHOICE = detect_encoder()
 VIDEO_ENCODER = VIDEO_ENCODER_CHOICE.name if VIDEO_ENCODER_CHOICE else None
 
+# A batch export queues many clips at once, but running every FFmpeg pass in parallel thrashes the
+# GPU and can exhaust the render disk mid-batch. This gates how many native renders run together;
+# the rest wait in "queued" and start as a slot frees up.
+RENDER_MAX_CONCURRENCY = max(1, int(os.environ.get("CLIPFORGE_RENDER_CONCURRENCY", "2")))
+RENDER_SLOT = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY)
+
+
+def _guarded_batch_render(jid: str, decision, punch_gain: float, encoder,
+                          overlay_dir: str | None, overlay_pin: ExitStack | None) -> None:
+    """A batch job thread that holds one render slot until the native pass finishes."""
+    with RENDER_SLOT:
+        if JOB_MANAGER.is_cancelled(jid):
+            if overlay_pin is not None:
+                overlay_pin.close()
+            return
+        _guarded_decision_render(jid, decision, punch_gain, encoder, overlay_dir, overlay_pin)
+
 
 def accelerator_summary(hw: dict) -> dict:
     """One honest answer to "what is this machine actually running on?", for the studio header."""
@@ -993,16 +1010,12 @@ def get_source_render_info(source_id: str, fps: str = "29.97"):
             "fps": resolve_output_fps(average, fps, nominal)}
 
 
-@app.post("/v1/render/decisions", dependencies=[Depends(verify_token)])
-async def create_decision_render_job(body: dict):
-    """Queue a backend render straight from the browser's editing decision.
+def _resolve_render_source(sid: str) -> tuple[str, tuple[int, int, float, float], object]:
+    """Validate the cached source once: file present, disk headroom, a readable stream, an encoder.
 
-    The source is addressed by its cached `sourceId` and the path is resolved here, so a request can
-    never name an arbitrary file on this machine.
+    Shared by the single-decision and batch endpoints so a batch never re-probes the same file per
+    clip and a request can never name an arbitrary path (the path is rebuilt from the safe `sid`).
     """
-    sid = _safe_source_id(body.get("sourceId"))
-    if not sid:
-        raise HTTPException(status_code=400, detail="sourceId is required")
     source_path = os.path.join(SOURCES_DIR, f"{sid}.mp4")
     if not os.path.isfile(source_path):
         raise HTTPException(status_code=409, detail="Source is not cached locally; upload it first")
@@ -1017,34 +1030,43 @@ async def create_decision_render_job(body: dict):
                 "an export needs headroom for its intermediate passes"
             ),
         )
-    payload = dict(body.get("decision") or {})
-    payload["source_path"] = source_path
     try:
         src_w, src_h, src_fps, src_nominal_fps = probe_source(source_path)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Cached source cannot be probed: {exc}")
     if not (src_w and src_h):
         raise HTTPException(status_code=422, detail="Cached source has no readable video stream")
+    encoder = VIDEO_ENCODER_CHOICE or detect_encoder()
+    if encoder is None:
+        raise HTTPException(status_code=503, detail="No working video encoder was measured on this machine")
+    return source_path, (src_w, src_h, src_fps or 30.0, src_nominal_fps or 0.0), encoder
+
+
+def _queue_decision_render(
+    sid: str, source_path: str, probed: tuple[int, int, float, float], encoder, entry: dict,
+    *, gated: bool = False,
+) -> str:
+    """Turn one {decision, punchGain, overlayId} entry into a queued native job thread."""
+    src_w, src_h, src_fps, src_nominal_fps = probed
+    payload = dict(entry.get("decision") or {})
+    payload["source_path"] = source_path
     payload["source_width"] = src_w
     payload["source_height"] = src_h
-    payload["source_fps"] = src_fps or 30.0
-    payload["source_nominal_fps"] = src_nominal_fps or 0.0
+    payload["source_fps"] = src_fps
+    payload["source_nominal_fps"] = src_nominal_fps
     try:
         decision = decision_from_payload(payload)
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid render decision: {exc}")
-    encoder = VIDEO_ENCODER_CHOICE or detect_encoder()
-    if encoder is None:
-        raise HTTPException(status_code=503, detail="No working video encoder was measured on this machine")
     overlay_dir = None
     overlay_pin = ExitStack()
     try:
-        punch_gain = float(body.get("punchGain") or 1.0)
+        punch_gain = float(entry.get("punchGain") or 1.0)
         if not math.isfinite(punch_gain) or not 0 <= punch_gain <= 3:
             raise ValueError("punchGain must be finite and between 0 and 3")
-        if body.get("overlayId") is not None:
+        if entry.get("overlayId") is not None:
             fps = resolve_output_fps(decision.source_fps, decision.target_fps, decision.source_nominal_fps)
-            overlay_dir = resolve_overlay(body["overlayId"], fps, decision.duration)
+            overlay_dir = resolve_overlay(entry["overlayId"], fps, decision.duration)
             overlay_pin.enter_context(reference_overlay(overlay_dir, fps, decision.duration))
     except (ValueError, TypeError) as exc:
         overlay_pin.close()
@@ -1054,15 +1076,65 @@ async def create_decision_render_job(body: dict):
             "render",
             {"sourceId": sid, "start": decision.start, "end": decision.end, "renderer": "ffmpeg-native"},
         )
+        runner = _guarded_batch_render if gated else _guarded_decision_render
         threading.Thread(
-            target=_guarded_decision_render,
+            target=runner,
             args=(job["id"], decision, punch_gain, encoder, overlay_dir, overlay_pin),
             daemon=True,
         ).start()
     except Exception:
         overlay_pin.close()
         raise
-    return {"job_id": job["id"], "status": "queued", "renderer": "ffmpeg-native", "encoder": encoder.name}
+    return job["id"]
+
+
+@app.post("/v1/render/decisions", dependencies=[Depends(verify_token)])
+async def create_decision_render_job(body: dict):
+    """Queue a backend render straight from the browser's editing decision.
+
+    The source is addressed by its cached `sourceId` and the path is resolved here, so a request can
+    never name an arbitrary file on this machine.
+    """
+    sid = _safe_source_id(body.get("sourceId"))
+    if not sid:
+        raise HTTPException(status_code=400, detail="sourceId is required")
+    source_path, probed, encoder = _resolve_render_source(sid)
+    job_id = _queue_decision_render(sid, source_path, probed, encoder, body)
+    return {"job_id": job_id, "status": "queued", "renderer": "ffmpeg-native", "encoder": encoder.name}
+
+
+@app.post("/v1/render/batch", dependencies=[Depends(verify_token)])
+async def create_batch_render_jobs(body: dict):
+    """Queue many clip decisions against one cached source in a single request.
+
+    The source is probed and the encoder chosen once; each entry carries its own decision, punchGain
+    and overlayId, so caption overlays stay per-clip while the video is uploaded/cached only once.
+    Render passes are gated by RENDER_SLOT so a large batch streams instead of thrashing the GPU.
+    """
+    sid = _safe_source_id(body.get("sourceId"))
+    if not sid:
+        raise HTTPException(status_code=400, detail="sourceId is required")
+    entries = body.get("jobs")
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(status_code=400, detail="jobs[] is required and must not be empty")
+    if len(entries) > 40:
+        raise HTTPException(status_code=400, detail="A batch is limited to 40 clips per request")
+    source_path, probed, encoder = _resolve_render_source(sid)
+    job_ids: list[str] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            for job_id in job_ids:
+                with suppress(Exception):
+                    JOB_MANAGER.cancel_job(job_id)
+            raise HTTPException(status_code=400, detail=f"jobs[{index}] must be an object")
+        job_ids.append(_queue_decision_render(sid, source_path, probed, encoder, entry, gated=True))
+    return {
+        "job_ids": job_ids,
+        "status": "queued",
+        "renderer": "ffmpeg-native",
+        "encoder": encoder.name,
+        "concurrency": RENDER_MAX_CONCURRENCY,
+    }
 
 
 @app.post("/v1/render/jobs", dependencies=[Depends(verify_token)])

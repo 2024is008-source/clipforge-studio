@@ -161,7 +161,7 @@ class IntelligenceApiTests(unittest.TestCase):
                 self.assertEqual([p.name for p in Path(self.temp.name).iterdir()], ["source.mp4"])
 
     def test_render_info_preserves_source_cadence(self):
-        for fps, expected in ((24, 24), (24000 / 1001, 24000 / 1001), (60, 30)):
+        for fps, expected in ((24, 24), (24000 / 1001, 24000 / 1001), (60, 60), (50, 50)):
             with self.subTest(fps=fps), patch.object(main, "probe_source", return_value=(1920, 1080, fps, fps)):
                 response = self.client.get("/v1/sources/source/render-info?fps=30")
             self.assertEqual(response.json()["fps"], expected)
@@ -171,6 +171,55 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/sources/source.mp4/render-info").status_code, 400)
         with patch.object(main, "probe_source", side_effect=ValueError("No video")):
             self.assertEqual(self.client.get("/v1/sources/source/render-info").status_code, 422)
+
+    def test_batch_queues_all_jobs_against_one_probe(self):
+        executed = []
+        with patch.object(main, "VIDEO_ENCODER_CHOICE", None), \
+             patch.object(main, "detect_encoder", return_value=SimpleNamespace(name="cpu")), \
+             patch.object(main, "probe_source", return_value=(1920, 1080, 24, 24)) as probe, \
+             patch.object(main, "_execute_decision_render", side_effect=lambda *a: executed.append(a[0])):
+            response = self.client.post("/v1/render/batch", json={
+                "sourceId": "source",
+                "jobs": [
+                    {"decision": {"start": 1, "end": 3, "layout": "auto"}},
+                    {"decision": {"start": 5, "end": 8, "layout": "fit"}, "punchGain": 0.5},
+                ],
+            })
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["job_ids"], ["job0", "job1"])
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["concurrency"], main.RENDER_MAX_CONCURRENCY)
+        # One source probe for the whole batch, not one per clip.
+        probe.assert_called_once()
+        self.assertEqual(len(executed), 2)
+        self.assertEqual(len(self.jobs.jobs), 2)
+
+    def test_batch_rejects_empty_oversized_and_malformed(self):
+        env = (
+            patch.object(main, "VIDEO_ENCODER_CHOICE", None),
+            patch.object(main, "detect_encoder", return_value=SimpleNamespace(name="cpu")),
+            patch.object(main, "probe_source", return_value=(1920, 1080, 24, 24)),
+            patch.object(main, "_execute_decision_render"),
+        )
+        for patcher in env:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assertEqual(self.client.post("/v1/render/batch", json={"sourceId": "source", "jobs": []}).status_code, 400)
+        self.assertEqual(self.client.post("/v1/render/batch", json={"sourceId": "source"}).status_code, 400)
+        self.assertEqual(self.client.post(
+            "/v1/render/batch",
+            json={"sourceId": "source", "jobs": [{"decision": {"start": 1, "end": 3, "layout": "auto"}}] * 41},
+        ).status_code, 400)
+        self.assertEqual(self.client.post(
+            "/v1/render/batch", json={"sourceId": "source", "jobs": [{"decision": {}}, "not-an-object"]},
+        ).status_code, 400)
+
+    def test_batch_rejects_missing_source(self):
+        self.assertEqual(
+            self.client.post("/v1/render/batch", json={"sourceId": "missing", "jobs": [{"decision": {"start": 1, "end": 3}}]}).status_code,
+            409,
+        )
 
     def test_render_overlay_is_pinned_at_resolved_cadence_and_released_on_failure(self):
         lifecycle = []

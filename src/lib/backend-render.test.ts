@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BackendUnavailable, browserCaptureForced, decisionFromJob, renderWithLocalBackend } from "./backend-render";
+import { BackendUnavailable, decisionFromJob, renderWithLocalBackend } from "./backend-render";
 import { exportClip, type ClipJob } from "./render";
 import { uploadRenderOverlays } from "./render-overlays";
 
@@ -35,7 +35,6 @@ const job: ClipJob = {
     progressBar: false,
     zoomPunch: true,
     wordsPerPage: 3,
-    fps: "29.97",
     voiceEnhance: true,
     manualX: null,
     manualY: null,
@@ -89,7 +88,6 @@ describe("decisionFromJob", () => {
 const sourceFps = 24000 / 1001;
 const nativeJob: ClipJob = {
   ...job,
-  settings: { ...job.settings, fps: "30" },
   track: [{
     t: job.start, x: 0.5, y: 0.3, mode: "fit", trackingConfidence: 0,
     layoutDecision: { scene: 2, reason: "low_tracking_confidence" },
@@ -98,7 +96,7 @@ const nativeJob: ClipJob = {
 const base = "http://localhost:8765/v1";
 const sourceId = "cached/source";
 const sourceUrl = `${base}/sources/cached%2Fsource`;
-const infoUrl = `${sourceUrl}/render-info?fps=30`;
+const infoUrl = `${sourceUrl}/render-info`;
 const overlayId = "overlay/one";
 const overlayUrl = `${base}/render/overlays/overlay%2Fone`;
 const decisionUrl = `${base}/render/decisions`;
@@ -161,7 +159,7 @@ describe("native render transport", () => {
     expect(body).toMatchObject({
       sourceId, overlayId, punchGain: 1,
       decision: {
-        fps: "30", start: nativeJob.start, end: nativeJob.end,
+        start: nativeJob.start, end: nativeJob.end,
         track: [{ mode: "fit", trackingConfidence: 0, layoutDecision: { scene: 2, reason: "low_tracking_confidence" } }],
       },
     });
@@ -311,16 +309,5 @@ describe("no automatic browser capture fallback", () => {
     expect(createElement).not.toHaveBeenCalled();
     expect(recorder).not.toHaveBeenCalled();
     expect(audio).not.toHaveBeenCalled();
-  });
-
-  it("requires the explicit development switch and stays native when storage is inaccessible", () => {
-    expect(browserCaptureForced()).toBe(false);
-    vi.mocked(localStorage.getItem).mockReturnValue("1");
-    expect(browserCaptureForced()).toBe(true);
-    expect(localStorage.getItem).toHaveBeenLastCalledWith("clipforge_browser_capture");
-    vi.mocked(localStorage.getItem).mockReturnValue("true");
-    expect(browserCaptureForced()).toBe(false);
-    vi.mocked(localStorage.getItem).mockImplementation(() => { throw new Error("storage blocked"); });
-    expect(browserCaptureForced()).toBe(false);
   });
 });
