@@ -716,7 +716,7 @@ export async function analyzeReframeWithLocalWorker(
   framingMode: "auto" | "fill" | "split" | "fit" | "grid3" | "editorial",
   signal?: AbortSignal,
   options?: { sourceId?: string; onProgress?: ((p: number) => void) | undefined },
-): Promise<{ track: TrackPoint[]; speakers?: SpeakerReport }> {
+): Promise<{ track: TrackPoint[]; speakers?: SpeakerReport; fps?: number }> {
   const sourceId = options?.sourceId ?? (await workerSourceId(file));
   const post = async (withFile: boolean) => {
     const fd = new FormData();
@@ -755,7 +755,7 @@ export async function analyzeReframeWithLocalWorker(
         status: string;
         progress: number;
         error?: string;
-        result?: { ok: boolean; track: TrackPoint[]; speakers?: SpeakerReport };
+        result?: { ok: boolean; track: TrackPoint[]; speakers?: SpeakerReport; fps?: number };
       };
       if (state.status === "error") throw new Error(state.error || "Video analysis failed");
       if (state.status === "cancelled")
@@ -766,9 +766,10 @@ export async function analyzeReframeWithLocalWorker(
           throw new Error("Worker reframe analysis returned no track points");
         }
         options?.onProgress?.(1);
+        const fps = typeof state.result.fps === "number" ? { fps: state.result.fps } : {};
         return state.result.speakers
-          ? { track: state.result.track, speakers: state.result.speakers }
-          : { track: state.result.track };
+          ? { track: state.result.track, speakers: state.result.speakers, ...fps }
+          : { track: state.result.track, ...fps };
       }
       await new Promise((resolve) => setTimeout(resolve, 700));
     }

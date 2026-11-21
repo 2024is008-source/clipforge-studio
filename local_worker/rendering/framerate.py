@@ -1,9 +1,10 @@
-"""The output frame rate comes from the footage, not from the export dropdown's default.
+"""The output frame rate is the footage's own cadence, never the export default.
 
 24 fps film pushed to 29.97 by frame duplication judders on any slow move: the extra frames land in
-an uneven 4-4-5-4 pattern rather than spread out. The studio's control only offers 29.97 or 30, and
-neither is a request to resample someone's footage, so the measured source cadence wins unless the
-requested rate is the same cadence or a clean whole multiple of it.
+an uneven 4-4-5-4 pattern rather than spread out. Forcing a 60 fps source down to 30 throws away
+motion the user paid for. The studio no longer offers a target frame rate at all, so the measured
+source cadence is what the render is cut at — snapped to the exact rational of the standard rate the
+footage was shot on, so the filters' frame grid and the container timestamps agree.
 
 No optical-flow interpolation happens anywhere here: frames are never invented, only counted.
 """
@@ -29,8 +30,6 @@ STANDARD_RATES: tuple[tuple[float, str], ...] = (
 
 # A source further from a standard rate than this is its own cadence and is not snapped.
 SNAP_TOLERANCE = 0.15
-# How close a rate ratio must be to a whole number before resampling keeps the cadence.
-MULTIPLE_TOLERANCE = 0.02
 # Frame intervals this far apart describe different streams, not one cadence read two ways.
 VFR_INTERVAL_MS = 0.5
 MIN_OUTPUT_FPS = 6.0
@@ -102,30 +101,15 @@ def choose_source_rate(average: float, nominal: float = 0.0) -> float:
     return max(average, nominal)
 
 
-def resolve_output_fps(source_fps: float, target: str | float, nominal_fps: float = 0.0) -> float:
-    """The rate the render should be cut at, preserving the source cadence where it can.
+def resolve_output_fps(source_fps: float, target: str | float = DEFAULT_OUTPUT_FPS, nominal_fps: float = 0.0) -> float:
+    """The rate the render is cut at: the source's own cadence, snapped to its standard rational.
 
-    Three cases are safe to honour the requested rate: it already is the source's rate, it is a whole
-    multiple of the source (30 to 60 duplicates evenly), or the source is a whole multiple of it
-    (60 to 30 drops every other frame evenly). Anything else - 23.976 to 29.97, 24 to 30, 25 to 29.97
-    - repeats frames unevenly, and that unevenness is the judder.
+    The `target` argument is kept only so an unmeasurable source (missing, or outside the encoder's
+    sane range) still has a sane fallback. For any real footage the source wins outright: 24 stays 24,
+    25 stays 25, 60 stays 60. Resampling to a whole multiple is no longer offered, because dropping or
+    duplicating frames to hit a broadcast number is exactly the judder and lost-motion this guards.
     """
-    requested = requested_fps(target)
     source = snap_to_standard(choose_source_rate(source_fps, nominal_fps))
-    if not (MIN_OUTPUT_FPS <= source <= MAX_OUTPUT_FPS):
-        return requested
-    if abs(source - requested) <= SNAP_TOLERANCE:
+    if MIN_OUTPUT_FPS <= source <= MAX_OUTPUT_FPS:
         return source
-    up, down = requested / source, source / requested
-    if _is_whole_multiple(up):
-        return snap_to_standard(requested)
-    if _is_whole_multiple(down):
-        # Halve or third the source's own rate rather than the requested number: 60 to 29.97 would
-        # repeat one frame in a thousand, while 60 to 30 drops exactly every other one.
-        return snap_to_standard(source / round(down))
-    return source
-
-
-def _is_whole_multiple(ratio: float) -> bool:
-    whole = round(ratio)
-    return whole >= 2 and abs(ratio - whole) <= MULTIPLE_TOLERANCE
+    return requested_fps(target)

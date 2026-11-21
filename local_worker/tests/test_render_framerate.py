@@ -85,9 +85,12 @@ class ResolveOutputRateTest(unittest.TestCase):
     def test_a_request_that_matches_the_source_keeps_the_source(self):
         self.assertAlmostEqual(resolve_output_fps(29.97002997002997, "30"), 29.97002997002997, places=9)
 
-    def test_a_clean_whole_multiple_is_allowed(self):
-        self.assertAlmostEqual(resolve_output_fps(29.97002997002997, "59.94"), 59.94005994005994, places=9)
-        self.assertAlmostEqual(resolve_output_fps(59.94005994005994, "29.97"), 29.97002997002997, places=9)
+    def test_a_clean_multiple_target_does_not_override_the_source(self):
+        """The source cadence is authoritative: a 60 fps file renders at 60, not the 30 it could hit."""
+        self.assertAlmostEqual(resolve_output_fps(29.97002997002997, "59.94"), 29.97002997002997, places=9)
+        self.assertAlmostEqual(resolve_output_fps(59.94005994005994, "29.97"), 59.94005994005994, places=9)
+        self.assertAlmostEqual(resolve_output_fps(60.0, "30"), 60.0, places=9)
+        self.assertAlmostEqual(resolve_output_fps(50.0, "25"), 50.0, places=9)
 
     def test_an_uneven_conversion_stays_at_the_source_cadence(self):
         """24 to 29.97 is a 4-4-5-4 pattern, so the request is refused rather than juddered through."""
